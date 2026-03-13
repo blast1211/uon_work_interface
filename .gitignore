@@ -1,3 +1,13 @@
+
+Pipfile
+Pipfile.lock
+red.png
+blue.png
+request_test.py
+widget.py
+work_script/
+crolling_test/
+
 # Python
 __pycache__/
 *.py[cod]
@@ -10,6 +20,7 @@ venv/
 
 # Editor
 .vscode/
+.uv-cache
 
 # OS files
 .DS_Store
