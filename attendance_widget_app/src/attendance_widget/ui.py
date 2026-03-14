@@ -1,39 +1,52 @@
 ﻿from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 
 from PySide6.QtCore import QObject, QPoint, QSettings, QThread, QTimer, Qt, Signal, Slot
-from PySide6.QtGui import QColor, QFont, QFontDatabase, QPainter, QPen, QPixmap
+from PySide6.QtGui import QColor, QFont, QFontDatabase, QKeySequence, QPainter, QPen, QPixmap, QRegion, QShortcut
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QFrame,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QListWidget,
+    QListWidgetItem,
     QMessageBox,
+    QPlainTextEdit,
     QProgressBar,
     QPushButton,
     QSizePolicy,
     QSlider,
+    QStackedWidget,
     QVBoxLayout,
     QWidget,
 )
 
 from attendance_widget.automation import AttendanceAutomation, AttendanceError, AttendanceSnapshot
 from attendance_widget.calculations import normalize_times, target_minutes_for_label, week_date_strings, worked_minutes
+from attendance_widget.chat import ChatConfig, LanChatClient
 from attendance_widget.config import load_settings
 
 
 ASSET_ROOT = Path(__file__).resolve().parents[3]
 FONT_PATH = ASSET_ROOT / "koverwatch.ttf"
-BLUE_PATH = ASSET_ROOT / "overwatch_blue_new.png"
-RED_PATH  = ASSET_ROOT / "overwatch_red_new.png"
+BLUE_PATH = ASSET_ROOT / "occupation_blue.png"
+RED_PATH  = ASSET_ROOT / "occupation_red.png"
+HOG_THUMB_PATH = ASSET_ROOT / "hog_thumb.png"
+HP_ICON_PATH = ASSET_ROOT / "HP.png"
+Q_SKILL_PATH = ASSET_ROOT / "Q_skill.png"
+HOG_SKILL_PATH = ASSET_ROOT / "hog_skill.png"
+HOG_GUN_PATH = ASSET_ROOT / "hog_gun.png"
 DAY_NAMES = ["월", "화", "수", "목", "금"]
 REFRESH_INTERVAL_MS = 10_000
 SETTINGS_ORG = "Chansol"
 SETTINGS_APP = "AttendanceWidget"
+BASE_UI_WIDTH = 1920
+BASE_UI_HEIGHT = 1080
 
 
 class SessionWorker(QObject):
@@ -108,117 +121,298 @@ class SessionWorker(QObject):
         return self.automation
 
 
-class DayRowWidget(QFrame):
-    def __init__(self, day_name: str, font_family: str, parent: QWidget | None = None) -> None:
+class WeeklyOvertimeRow(QFrame):
+    def __init__(self, font_family: str, ui_scale: float, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self.day_name = day_name
-        self.balance_minutes = 0
-        self.come_time = "--:--"
-        self.leave_time = "--:--"
-        self.expanded = False
-        self.max_minutes = 1
         self.font_family = font_family
-        self.row_font = QFont(font_family, 13)
-        self.row_font.setItalic(False)
-        self.row_font.setBold(False)
-        self.row_font.setLetterSpacing(QFont.AbsoluteSpacing, 0.8)
-        self.detail_font = QFont(font_family, 12)
-        self.detail_font.setItalic(False)
-        self.detail_font.setBold(False)
-        self.detail_font.setLetterSpacing(QFont.AbsoluteSpacing, 0.8)
+        self.ui_scale = ui_scale
+        self.balance_minutes = 0
+        self.max_minutes = 1
+        self.setMinimumHeight(max(40, int(round(54 * self.ui_scale))))
+        self.setStyleSheet("QFrame { background: transparent; border: none; }")
 
-        self.setStyleSheet(
-            f"QFrame {{ background: transparent; border: none; font-family: '{font_family}'; }}"
-            f"QLabel {{ color: white; font-family: '{font_family}'; font-weight: 400; }}"
+        self.base_panel = QFrame(self)
+        self.base_panel.setStyleSheet("QFrame { background: rgba(8, 18, 28, 220); border: none; }")
+
+        self.fill_panel = QFrame(self.base_panel)
+        self.fill_panel.setStyleSheet("QFrame { background: rgba(47, 166, 255, 210); border: none; }")
+
+        self.content = QWidget(self.base_panel)
+        self.content.setAttribute(Qt.WA_TranslucentBackground)
+        layout = QHBoxLayout(self.content)
+        layout.setContentsMargins(18, 0, 18, 0)
+        layout.setSpacing(20)
+
+        self.day_label = QLabel(self.content)
+        self.balance_label = QLabel(self.content)
+        self.come_label = QLabel(self.content)
+        self.leave_label = QLabel(self.content)
+
+        for label, width, alignment in (
+            (self.day_label, int(round(110 * self.ui_scale)), Qt.AlignLeft | Qt.AlignVCenter),
+            (self.balance_label, int(round(190 * self.ui_scale)), Qt.AlignLeft | Qt.AlignVCenter),
+            (self.come_label, int(round(150 * self.ui_scale)), Qt.AlignLeft | Qt.AlignVCenter),
+            (self.leave_label, int(round(150 * self.ui_scale)), Qt.AlignLeft | Qt.AlignVCenter),
+        ):
+            label.setMinimumWidth(width)
+            label.setAlignment(alignment)
+            label.setStyleSheet(
+                f"color: rgba(245,250,255,0.96); font-family: '{self.font_family}'; font-size: {max(14, int(round(22 * self.ui_scale)))}px; background: transparent;"
+            )
+            layout.addWidget(label, 1)
+
+        self.balance_label.setStyleSheet(
+            f"color: rgba(245,250,255,0.96); font-family: '{self.font_family}'; font-size: {max(14, int(round(22 * self.ui_scale)))}px; background: transparent;"
         )
+
+    def resizeEvent(self, event) -> None:
+        self.base_panel.setGeometry(self.rect())
+        self.content.setGeometry(self.base_panel.rect())
+        self._update_fill()
+        super().resizeEvent(event)
+
+    def set_row_data(self, day_name: str, balance_minutes: int, come_time: str, leave_time: str, max_minutes: int) -> None:
+        self.balance_minutes = balance_minutes
+        self.max_minutes = max(max_minutes, 1)
+        self.day_label.setText(day_name)
+        self.balance_label.setText(self._format_balance(balance_minutes))
+        self.come_label.setText(come_time)
+        self.leave_label.setText(leave_time)
+
+        if balance_minutes >= 0:
+            fill_color = 'rgba(170, 34, 55, 215)'
+            balance_color = '#ff8f98'
+        else:
+            fill_color = 'rgba(18, 122, 178, 215)'
+            balance_color = '#7aeaff'
+
+        self.fill_panel.setStyleSheet(f"QFrame {{ background: {fill_color}; border: none; }}")
+        self.balance_label.setStyleSheet(
+            f"color: {balance_color}; font-family: '{self.font_family}'; font-size: {max(14, int(round(22 * self.ui_scale)))}px; background: transparent;"
+        )
+        self._update_fill()
+
+    def _update_fill(self) -> None:
+        ratio = min(1.0, abs(self.balance_minutes) / max(self.max_minutes, 1))
+        fill_width = int(self.base_panel.width() * ratio)
+        self.fill_panel.setGeometry(0, 0, fill_width, self.base_panel.height())
+
+    @staticmethod
+    def _format_balance(minutes: int) -> str:
+        sign = '+' if minutes >= 0 else '-'
+        hours, remain = divmod(abs(minutes), 60)
+        return f"{sign}{hours}:{remain:02d}"
+
+
+class WeeklyOvertimeTable(QFrame):
+    DAY_ORDER = {name: index for index, name in enumerate(DAY_NAMES)}
+
+    def __init__(self, font_family: str, ui_scale: float, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.font_family = font_family
+        self.ui_scale = ui_scale
+        self.rows_data: list[dict[str, object]] = []
+        self.sort_key = 'day'
+        self.setStyleSheet("QFrame { background: transparent; border: none; }")
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
-        outer.setSpacing(4)
+        outer.setSpacing(max(4, int(round(6 * self.ui_scale))))
+
+        self.header = QFrame(self)
+        self.header.setStyleSheet("QFrame { background: rgba(255,255,255,0.96); border: none; }")
+        header_layout = QHBoxLayout(self.header)
+        header_layout.setContentsMargins(int(round(18 * self.ui_scale)), int(round(10 * self.ui_scale)), int(round(18 * self.ui_scale)), int(round(10 * self.ui_scale)))
+        header_layout.setSpacing(int(round(20 * self.ui_scale)))
+
+        self.header_buttons: dict[str, QPushButton] = {}
+        for key, title, width, alignment in (
+            ('day', '요일', 110, Qt.AlignLeft | Qt.AlignVCenter),
+            ('balance', '초과근무시간', 190, Qt.AlignLeft | Qt.AlignVCenter),
+            ('come', '출근시간', 150, Qt.AlignLeft | Qt.AlignVCenter),
+            ('leave', '퇴근시간', 150, Qt.AlignLeft | Qt.AlignVCenter),
+        ):
+            button = QPushButton(title, self.header)
+            button.setCursor(Qt.PointingHandCursor)
+            button.setMinimumWidth(int(round(width * self.ui_scale)))
+            button.setStyleSheet(
+                f"QPushButton {{ color: #16212c; font-family: '{self.font_family}'; font-size: {max(14, int(round(22 * self.ui_scale)))}px; background: transparent; border: none; text-align: left; padding: 0px; }}"
+                "QPushButton:hover { color: #0a7f95; }"
+            )
+            button.clicked.connect(lambda checked=False, sort_key=key: self.set_sort(sort_key))
+            header_layout.addWidget(button, 1, alignment)
+            self.header_buttons[key] = button
+        outer.addWidget(self.header)
+
+        self.rows_container = QWidget(self)
+        self.rows_layout = QVBoxLayout(self.rows_container)
+        self.rows_layout.setContentsMargins(0, 0, 0, 0)
+        self.rows_layout.setSpacing(max(2, int(round(4 * self.ui_scale))))
+        outer.addWidget(self.rows_container)
+
+        self.row_widgets = [WeeklyOvertimeRow(font_family, self.ui_scale, self.rows_container) for _ in DAY_NAMES]
+        for row in self.row_widgets:
+            self.rows_layout.addWidget(row)
+
+        self._refresh_header_styles()
+
+    def set_rows(self, rows: list[dict[str, object]]) -> None:
+        self.rows_data = list(rows)
+        self._apply_rows()
+
+    def set_sort(self, sort_key: str) -> None:
+        self.sort_key = sort_key
+        self._refresh_header_styles()
+        self._apply_rows()
+
+    def _refresh_header_styles(self) -> None:
+        titles = {
+            'day': '요일',
+            'balance': '초과근무시간',
+            'come': '출근시간',
+            'leave': '퇴근시간',
+        }
+        for key, button in self.header_buttons.items():
+            marker = ' v' if key == self.sort_key else ''
+            button.setText(f"{titles[key]}{marker}")
+
+    def _apply_rows(self) -> None:
+        rows = sorted(self.rows_data, key=self._sort_value_for_row)
+        max_minutes = max((abs(int(row['balance_minutes'])) for row in rows), default=1)
+        max_minutes = max(max_minutes, 1)
+        for widget, row in zip(self.row_widgets, rows):
+            widget.set_row_data(
+                str(row['day_name']),
+                int(row['balance_minutes']),
+                str(row['come_time']),
+                str(row['leave_time']),
+                max_minutes,
+            )
+            widget.show()
+        for widget in self.row_widgets[len(rows):]:
+            widget.hide()
+
+    def _sort_value_for_row(self, row: dict[str, object]):
+        if self.sort_key == 'day':
+            return self.DAY_ORDER.get(str(row['day_name']), 99)
+        if self.sort_key == 'balance':
+            return (-int(row['balance_minutes']), self.DAY_ORDER.get(str(row['day_name']), 99))
+        if self.sort_key == 'come':
+            return (-self._time_to_minutes(str(row['come_time'])), self.DAY_ORDER.get(str(row['day_name']), 99))
+        if self.sort_key == 'leave':
+            return (-self._time_to_minutes(str(row['leave_time'])), self.DAY_ORDER.get(str(row['day_name']), 99))
+        return self.DAY_ORDER.get(str(row['day_name']), 99)
+
+    @staticmethod
+    def _time_to_minutes(text: str) -> int:
+        if text == '--:--' or ':' not in text:
+            return -1
+        hour_text, minute_text = text.split(':', 1)
+        try:
+            return int(hour_text) * 60 + int(minute_text)
+        except ValueError:
+            return -1
+
+
+class ChatInputBox(QPlainTextEdit):
+    send_requested = Signal(str)
+    dismissed = Signal()
+
+    def keyPressEvent(self, event) -> None:
+        if event.key() in (Qt.Key_Return, Qt.Key_Enter):
+            if event.modifiers() & Qt.ShiftModifier:
+                super().keyPressEvent(event)
+                return
+            text = self.toPlainText().strip()
+            if text:
+                self.send_requested.emit(text)
+                self.clear()
+            event.accept()
+            return
+        if event.key() == Qt.Key_Escape:
+            self.dismissed.emit()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+
+class CollapsibleSection(QFrame):
+    toggled = Signal(bool)
+
+    def __init__(self, title: str, font_family: str, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.title = title
+        self.font_family = font_family
+        self.expanded = False
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(8)
 
         self.header = QFrame(self)
         self.header.setCursor(Qt.PointingHandCursor)
+        self.header.setStyleSheet(
+            "QFrame { background: white; border: 1px solid rgba(24,36,54,0.16); border-radius: 8px; }"
+            "QFrame:hover { background: #f4f7fb; }"
+        )
         header_layout = QHBoxLayout(self.header)
-        header_layout.setContentsMargins(4, 6, 4, 6)
+        header_layout.setContentsMargins(14, 10, 14, 10)
         header_layout.setSpacing(8)
 
-        self.arrow_label = QLabel(">", self.header)
-        self.arrow_label.setFixedWidth(12)
-        self.arrow_label.setFont(self.row_font)
-        header_layout.addWidget(self.arrow_label)
+        self.title_label = QLabel(title, self.header)
+        self.title_label.setStyleSheet(
+            f"color: #1a2533; background: transparent; font-family: '{self.font_family}'; font-size: 14px;"
+        )
+        header_layout.addWidget(self.title_label, 1)
 
-        self.day_label = QLabel(day_name, self.header)
-        self.day_label.setFixedWidth(30)
-        self.day_label.setFont(self.row_font)
-        header_layout.addWidget(self.day_label)
+        self.indicator_label = QLabel("v", self.header)
+        self.indicator_label.setAlignment(Qt.AlignCenter)
+        self.indicator_label.setFixedWidth(18)
+        self.indicator_label.setStyleSheet(
+            f"color: #1a2533; background: transparent; font-family: '{self.font_family}'; font-size: 14px;"
+        )
+        header_layout.addWidget(self.indicator_label)
 
-        self.bar_track = QFrame(self.header)
-        self.bar_track.setMinimumHeight(12)
-        self.bar_track.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        self.bar_track.setStyleSheet("QFrame { background: rgba(255,255,255,0.08); border-radius: 6px; }")
-        self.bar_fill = QFrame(self.bar_track)
-        self.bar_fill.setGeometry(0, 0, 0, 12)
-        self.bar_fill.setStyleSheet("QFrame { background: #ff5a5a; border-radius: 6px; }")
-        header_layout.addWidget(self.bar_track, 1)
+        layout.addWidget(self.header)
 
-        self.balance_label = QLabel("0:00", self.header)
-        self.balance_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-        self.balance_label.setFixedWidth(64)
-        self.balance_label.setFont(self.row_font)
-        header_layout.addWidget(self.balance_label)
+        self.content = QFrame(self)
+        self.content.setVisible(False)
+        self.content.setStyleSheet("QFrame { background: transparent; border: none; }")
+        self.content_layout = QVBoxLayout(self.content)
+        self.content_layout.setContentsMargins(6, 2, 6, 0)
+        self.content_layout.setSpacing(10)
+        layout.addWidget(self.content)
 
-        outer.addWidget(self.header)
+        self.header.mousePressEvent = self._handle_header_click
+        self.title_label.mousePressEvent = self._handle_header_click
+        self.indicator_label.mousePressEvent = self._handle_header_click
 
-        self.detail_label = QLabel(self)
-        self.detail_label.setVisible(False)
-        self.detail_label.setTextFormat(Qt.RichText)
-        self.detail_label.setFont(self.detail_font)
-        self.detail_label.setStyleSheet(f"color: rgba(255,255,255,0.76); font-family: '{font_family}';")
-        outer.addWidget(self.detail_label)
-
-        self.set_row_data(0, "--:--", "--:--", 1)
+    def _handle_header_click(self, event) -> None:
+        if event.button() == Qt.LeftButton:
+            self.set_expanded(not self.expanded)
+            event.accept()
 
     def mousePressEvent(self, event) -> None:
-        if event.button() == Qt.LeftButton:
-            self.toggle()
+        if self.header.geometry().contains(event.position().toPoint()) and event.button() == Qt.LeftButton:
+            self.set_expanded(not self.expanded)
+            event.accept()
+            return
         super().mousePressEvent(event)
 
-    def toggle(self) -> None:
-        self.expanded = not self.expanded
-        self.detail_label.setVisible(self.expanded)
-        self.arrow_label.setText("v" if self.expanded else ">")
-        self.adjustSize()
+    def add_widget(self, widget: QWidget, stretch: int = 0, alignment: Qt.AlignmentFlag | None = None) -> None:
+        if alignment is None:
+            self.content_layout.addWidget(widget, stretch)
+        else:
+            self.content_layout.addWidget(widget, stretch, alignment)
 
-    def set_row_data(self, balance_minutes: int, come_time: str, leave_time: str, max_minutes: int) -> None:
-        self.balance_minutes = balance_minutes
-        self.come_time = come_time
-        self.leave_time = leave_time
-        self.max_minutes = max(max_minutes, 1)
-        self.balance_label.setText(self._format_balance(balance_minutes))
-        self.detail_label.setText(
-            "&nbsp;&nbsp;&nbsp;&nbsp;<span style='color:#57c7ff;'>출근</span> "
-            f"{come_time}<br>&nbsp;&nbsp;&nbsp;&nbsp;<span style='color:#ff8c5a;'>퇴근</span> {leave_time}"
-        )
+    def add_layout(self, layout: QVBoxLayout | QHBoxLayout, stretch: int = 0) -> None:
+        self.content_layout.addLayout(layout, stretch)
 
-        color = "#ff5a5a" if balance_minutes >= 0 else "#3aa7ff"
-        self.balance_label.setStyleSheet(f"color: {color};")
-        self.bar_fill.setStyleSheet(f"QFrame {{ background: {color}; border-radius: 6px; }}")
-        self._update_bar()
-
-    def resizeEvent(self, event) -> None:
-        self._update_bar()
-        super().resizeEvent(event)
-
-    def _update_bar(self) -> None:
-        track_width = max(self.bar_track.width(), 1)
-        ratio = abs(self.balance_minutes) / self.max_minutes
-        fill_width = max(8 if abs(self.balance_minutes) > 0 else 0, int(track_width * ratio))
-        self.bar_fill.setGeometry(0, 0, fill_width, self.bar_track.height())
-
-    def _format_balance(self, minutes: int) -> str:
-        sign = "+" if minutes >= 0 else "-"
-        hours, remain = divmod(abs(minutes), 60)
-        return f"{sign}{hours}:{remain:02d}"
+    def set_expanded(self, expanded: bool) -> None:
+        self.expanded = expanded
+        self.content.setVisible(expanded)
+        self.indicator_label.setText("^" if expanded else "v")
+        self.toggled.emit(expanded)
 
 
 class AttendanceWidget(QWidget):
@@ -232,6 +426,7 @@ class AttendanceWidget(QWidget):
         super().__init__()
         self.settings = load_settings()
         self.scale = 0.8
+        self.resolution_scale = self._calculate_resolution_scale()
         self.resizing = False
         self.old_pos: QPoint | None = None
         self.snapshot: AttendanceSnapshot | None = None
@@ -243,6 +438,79 @@ class AttendanceWidget(QWidget):
         self.card_pixmap = QPixmap()
         self.card_loading = False
         self.qt_settings = QSettings(SETTINGS_ORG, SETTINGS_APP)
+        self.chat_client: LanChatClient | None = None
+        self.chat_connected = False
+        self.chat_font_family = "Dotum"
+        self.chat_metrics = {
+            "panel_width": 430,
+            "panel_height": 300,
+            "panel_left": 34,
+            "panel_anchor_y": 0,
+            "title_font_size": 20,
+            "meta_font_size": 13,
+            "message_font_size": 16,
+            "input_font_size": 16,
+            "input_height": 82,
+            "list_spacing": 4,
+            "notice_width": 420,
+            "notice_height": 74,
+            "notice_left": 34,
+            "notice_gap": 14,
+        }
+        self.card_metrics = {
+            "image_scale": 0.5,
+            "text_left_x": 85,
+            "text_y": 20,
+            "text_left_width": 150,
+            "text_right_x_offset": 225,
+            "text_right_width": 126,
+            "text_height": 72,
+        }
+        self.hud_metrics = {
+            "left_thumb_padding_x": 36,
+            "left_thumb_padding_y": 34,
+            "left_thumb_scale": 0.2,
+            "left_hp_padding_x": 0,
+            "left_hp_padding_y": 90,
+            "left_hp_gap": 14,
+            "left_hp_scale": 0.08,
+            "center_q_offset_x": 0,
+            "center_q_padding_y": 30,
+            "center_q_scale": 0.25,
+            "right_skill_padding_x": 0,
+            "right_skill_padding_y": 60,
+            "right_skill_scale": 0.08,
+            "right_gun_padding_x": 80,
+            "right_gun_padding_y": 60,
+            "right_gun_gap": 18,
+            "right_gun_scale": 0.08,
+        }
+        self.settings_metrics = {
+            "settings_title_font_size": 31,
+            "tab_height": 38,
+            "tab_font_size": 21,
+            "section_title_font_size": 38,
+            "section_subtitle_font_size": 17,
+            "row_label_font_size": 25,
+            "row_value_font_size": 22,
+            "checkbox_font_size": 20,
+            "button_font_size": 24,
+            "action_button_font_size": 24,
+            "field_font_size": 16,
+            "username_field_font_size": 20,
+            "password_field_font_size": 20,
+            "status_font_size": 15,
+            "hint_font_size": 18,
+            "row_label_width": 120,
+            "row_label_width_compact": 140,
+            "input_height": 42,
+            "input_width": 300,
+            "single_button_width": 300,
+            "action_button_min_width": 0,
+            "tab_min_width": 20,
+            "tab_width": 100,
+            "chat_row_label_width": 160,
+        }
         self._load_assets()
         self._build_worker()
         self._build_ui()
@@ -250,6 +518,21 @@ class AttendanceWidget(QWidget):
         self._load_saved_preferences()
         self._update_score_card(0)
         self._set_logged_in_ui(False)
+
+    def _calculate_resolution_scale(self) -> float:
+        screen = QApplication.primaryScreen()
+        if screen is None:
+            return 1.0
+        available = screen.availableGeometry()
+        width_scale = available.width() / BASE_UI_WIDTH
+        height_scale = available.height() / BASE_UI_HEIGHT
+        return max(0.65, min(width_scale, height_scale))
+
+    def _scaled_metric(self, name: str, minimum: int = 1) -> int:
+        return max(minimum, int(round(self.settings_metrics[name] * self.resolution_scale)))
+
+    def _scaled_hud_metric(self, name: str) -> int:
+        return int(round(self.hud_metrics[name] * self.resolution_scale))
 
     def _display_font(self, size: int, italic: bool = False) -> QFont:
         font = QFont(self.font_family, size)
@@ -282,6 +565,11 @@ class AttendanceWidget(QWidget):
         self.card_pixmap = self.blue_bg if not self.blue_bg.isNull() else QPixmap()
         self.blue_bg_dim = self._make_dimmed_pixmap(self.blue_bg)
         self.red_bg_dim = self._make_dimmed_pixmap(self.red_bg)
+        self.hog_thumb_pixmap = QPixmap(str(HOG_THUMB_PATH))
+        self.hp_icon_pixmap = QPixmap(str(HP_ICON_PATH))
+        self.q_skill_pixmap = QPixmap(str(Q_SKILL_PATH))
+        self.hog_skill_pixmap = QPixmap(str(HOG_SKILL_PATH))
+        self.hog_gun_pixmap = QPixmap(str(HOG_GUN_PATH))
 
     def _make_dimmed_pixmap(self, pixmap: QPixmap) -> QPixmap:
         if pixmap.isNull():
@@ -304,13 +592,12 @@ class AttendanceWidget(QWidget):
 
     def _build_ui(self) -> None:
         self.setWindowTitle("근태 위젯")
-        self.setWindowFlags(Qt.WindowStaysOnTopHint | Qt.FramelessWindowHint)
+        self.setWindowFlags(Qt.WindowStaysOnTopHint | Qt.FramelessWindowHint | Qt.Tool)
         self.setAttribute(Qt.WA_TranslucentBackground)
 
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
-        root.setSpacing(2)
-        root.setAlignment(Qt.AlignLeft | Qt.AlignTop)
+        root.setSpacing(0)
 
         self.card = QWidget(self)
         self.card.setAttribute(Qt.WA_TranslucentBackground)
@@ -325,140 +612,903 @@ class AttendanceWidget(QWidget):
             label.setFont(score_font)
             label.setStyleSheet("color: white; background: transparent;")
 
-        root.addWidget(self.card, alignment=Qt.AlignLeft)
+        root.addWidget(self.card, alignment=Qt.AlignLeft | Qt.AlignTop)
+        self._build_settings_window()
+        self._build_chat_window()
+        self._apply_card_geometry()
+        self.adjustSize()
 
-        self.details_panel = QFrame(self)
-        self.details_panel.setVisible(False)
-        self.details_panel.setStyleSheet(
-            "QFrame { background: rgba(0,0,0,26); border: none; border-radius: 14px; }"
-            f"QLabel {{ color: white; font-family: '{self.font_family}'; font-weight: 400; }}"
-            f"QPushButton {{ background: rgba(255,255,255,0.12); color: white; border: none; border-radius: 8px; padding: 10px 12px; font-family: '{self.font_family}'; font-weight: 400; font-size: 15px; }}"
-            "QPushButton:hover { background: rgba(255,255,255,0.2); }"
-            "QPushButton:disabled { background: rgba(255,255,255,0.06); color: rgba(255,255,255,0.35); }"
-            f"QCheckBox {{ color: white; font-family: '{self.font_family}'; font-weight: 400; font-size: 14px; }}"
+    def _build_settings_window(self) -> None:
+        self.details_panel = QWidget(None)
+        self.details_panel.setWindowTitle("근태 설정")
+        self.details_panel.setWindowFlags(Qt.FramelessWindowHint | Qt.Tool | Qt.WindowStaysOnTopHint)
+        self.details_panel.setAttribute(Qt.WA_TranslucentBackground)
+
+        outer = QVBoxLayout(self.details_panel)
+        outer.setContentsMargins(22, 20, 22, 22)
+        outer.setSpacing(0)
+
+        self.settings_header = QWidget(self.details_panel)
+        header_layout = QVBoxLayout(self.settings_header)
+        header_layout.setContentsMargins(0, 0, 0, 0)
+        header_layout.setSpacing(10)
+
+        self.settings_title = QLabel("ATTENDANCE SETTINGS", self.settings_header)
+        self.settings_title.setStyleSheet(
+            f"color: rgba(234,242,255,0.85); font-family: '{self.font_family}'; font-size: {self._scaled_metric('settings_title_font_size')}px; letter-spacing: 1px; background: transparent;"
         )
-        details_layout = QVBoxLayout(self.details_panel)
-        details_layout.setContentsMargins(16, 14, 16, 14)
-        details_layout.setSpacing(12)
-        details_layout.setAlignment(Qt.AlignTop | Qt.AlignHCenter)
+        header_layout.addWidget(self.settings_title, alignment=Qt.AlignLeft)
 
-        top_row = QHBoxLayout()
-        top_row.setSpacing(12)
-        credentials_col = QVBoxLayout()
-        credentials_col.setSpacing(10)
+        tab_row = QHBoxLayout()
+        tab_row.setSpacing(15)
+        tab_row.setContentsMargins(0, 0, 0, 0)
+        self.settings_tab_buttons: list[QPushButton] = []
+        for index, title in enumerate(("세션", "요일별 근무", "환경 설정", "채팅")):
+            button = QPushButton(title, self.settings_header)
+            button.setCheckable(True)
+            button.setCursor(Qt.PointingHandCursor)
+            button.clicked.connect(lambda checked, idx=index: self._switch_settings_tab(idx))
+            button.setFixedHeight(self._scaled_metric("tab_height"))
+            if self.settings_metrics["tab_width"] > 0:
+                button.setFixedWidth(self._scaled_metric("tab_width"))
+            elif self.settings_metrics["tab_min_width"] > 0:
+                button.setMinimumWidth(self._scaled_metric("tab_min_width"))
+            self.settings_tab_buttons.append(button)
+            tab_row.addWidget(button)
+        tab_row.addStretch(1)
+        header_layout.addLayout(tab_row)
+        outer.addWidget(self.settings_header, alignment=Qt.AlignLeft | Qt.AlignTop)
+
+        outer.addStretch(1)
+
+        center_row = QHBoxLayout()
+        center_row.setContentsMargins(0, 0, 0, 0)
+        center_row.setSpacing(0)
+        center_row.addStretch(1)
+
+        self.settings_stack = QStackedWidget(self.details_panel)
+        self.settings_stack.setStyleSheet("QStackedWidget { background: transparent; }")
+        center_row.addWidget(self.settings_stack, alignment=Qt.AlignCenter)
+        center_row.addStretch(1)
+        outer.addLayout(center_row, 1)
+
+        outer.addStretch(1)
+
+        self.left_hud_thumb = QLabel(self.details_panel)
+        self.left_hud_thumb.setAttribute(Qt.WA_TranslucentBackground)
+        self.left_hud_thumb.setScaledContents(True)
+        self.left_hud_hp = QLabel(self.details_panel)
+        self.left_hud_hp.setAttribute(Qt.WA_TranslucentBackground)
+        self.left_hud_hp.setScaledContents(True)
+        self.center_hud_q = QLabel(self.details_panel)
+        self.center_hud_q.setAttribute(Qt.WA_TranslucentBackground)
+        self.center_hud_q.setScaledContents(True)
+        self.right_hud_skill = QLabel(self.details_panel)
+        self.right_hud_skill.setAttribute(Qt.WA_TranslucentBackground)
+        self.right_hud_skill.setScaledContents(True)
+        self.right_hud_gun = QLabel(self.details_panel)
+        self.right_hud_gun.setAttribute(Qt.WA_TranslucentBackground)
+        self.right_hud_gun.setScaledContents(True)
+
+        self.settings_cards: list[QFrame] = []
+
+        session_page = QWidget()
+        session_page_layout = QVBoxLayout(session_page)
+        session_page_layout.setContentsMargins(0, 0, 0, 0)
+        session_page_layout.setSpacing(0)
+        session_card, session_card_layout = self._create_settings_card("세션 관리", "로그인과 출퇴근 제어")
+
         self.username_input = QLineEdit()
-        self.username_input.setPlaceholderText("아이디")
-        credentials_col.addWidget(self.username_input)
+        self.username_input.setPlaceholderText("사내 계정")
+        self.username_input.setMinimumHeight(self._scaled_metric("input_height"))
+        if self.settings_metrics["input_width"] > 0:
+            self.username_input.setFixedWidth(self._scaled_metric("input_width"))
+        self.username_input.setStyleSheet(self._field_style("username_field_font_size"))
+        self._add_setting_row(session_card_layout, "아이디", self.username_input)
+
         self.password_input = QLineEdit()
         self.password_input.setPlaceholderText("비밀번호")
         self.password_input.setEchoMode(QLineEdit.Password)
-        credentials_col.addWidget(self.password_input)
-        top_row.addLayout(credentials_col, 1)
+        self.password_input.setMinimumHeight(self._scaled_metric("input_height"))
+        if self.settings_metrics["input_width"] > 0:
+            self.password_input.setFixedWidth(self._scaled_metric("input_width"))
+        self.password_input.setStyleSheet(self._field_style("password_field_font_size"))
+        self._add_setting_row(session_card_layout, "비밀번호", self.password_input)
 
         self.login_button = QPushButton("접속")
-        self.login_button.setFixedWidth(92)
-        self.login_button.setFont(self._display_font(15))
+        self.login_button.setFixedHeight(self._scaled_metric("input_height"))
+        if self.settings_metrics["single_button_width"] > 0:
+            self.login_button.setFixedWidth(self._scaled_metric("single_button_width"))
         self.login_button.clicked.connect(self.login_to_site)
-        top_row.addWidget(self.login_button, alignment=Qt.AlignBottom)
-        details_layout.addLayout(top_row)
-
-        self.headless_checkbox = QCheckBox("크롬 헤드리스")
-        self.headless_checkbox.setFont(self._display_font(14))
-        self.headless_checkbox.toggled.connect(self._on_headless_toggled)
-        details_layout.addWidget(self.headless_checkbox, alignment=Qt.AlignHCenter)
-
-        self.always_on_top_checkbox = QCheckBox("항상 위에 표시")
-        self.always_on_top_checkbox.setFont(self._display_font(14))
-        self.always_on_top_checkbox.toggled.connect(self._on_always_on_top_toggled)
-        details_layout.addWidget(self.always_on_top_checkbox, alignment=Qt.AlignHCenter)
-
-        opacity_title = QLabel("전체 투명도")
-        opacity_title.setFont(self._display_font(15))
-        details_layout.addWidget(opacity_title, alignment=Qt.AlignLeft)
-
-        opacity_row = QHBoxLayout()
-        opacity_row.setSpacing(10)
-        self.opacity_slider = QSlider(Qt.Horizontal)
-        self.opacity_slider.setRange(10, 90)
-        self.opacity_slider.valueChanged.connect(self._on_opacity_changed)
-        opacity_row.addWidget(self.opacity_slider, 1)
-        self.opacity_value_label = QLabel("50%")
-        self.opacity_value_label.setFont(self._display_font(14))
-        opacity_row.addWidget(self.opacity_value_label)
-        details_layout.addLayout(opacity_row)
-
-        refresh_title = QLabel("새로고침 주기")
-        refresh_title.setFont(self._display_font(15))
-        details_layout.addWidget(refresh_title, alignment=Qt.AlignLeft)
-
-        refresh_row = QHBoxLayout()
-        refresh_row.setSpacing(10)
-        self.refresh_interval_slider = QSlider(Qt.Horizontal)
-        self.refresh_interval_slider.setRange(10, 300)
-        self.refresh_interval_slider.valueChanged.connect(self._on_refresh_interval_changed)
-        refresh_row.addWidget(self.refresh_interval_slider, 1)
-        self.refresh_interval_value_label = QLabel("10초")
-        self.refresh_interval_value_label.setFont(self._display_font(14))
-        refresh_row.addWidget(self.refresh_interval_value_label)
-        details_layout.addLayout(refresh_row)
+        self.login_button.setStyleSheet(self._accent_button_style())
+        self._add_setting_row(session_card_layout, "로그인", self.login_button)
 
         action_row = QHBoxLayout()
-        action_row.setSpacing(8)
+        action_row.setSpacing(10)
         self.refresh_button = QPushButton("새로고침")
         self.work_in_button = QPushButton("출근")
         self.work_out_button = QPushButton("퇴근")
         self.exit_button = QPushButton("종료")
         for button in (self.refresh_button, self.work_in_button, self.work_out_button, self.exit_button):
-            button.setFont(self._display_font(15))
+            button.setFixedHeight(max(32, int(round(40 * self.resolution_scale))))
+            if self.settings_metrics["action_button_min_width"] > 0:
+                button.setMinimumWidth(self._scaled_metric("action_button_min_width"))
+            button.setStyleSheet(self._action_button_style())
+            action_row.addWidget(button)
         self.refresh_button.clicked.connect(self.refresh_snapshot)
         self.work_in_button.clicked.connect(self.work_in)
         self.work_out_button.clicked.connect(self.work_out)
         self.exit_button.clicked.connect(self.close_and_exit)
-        action_row.addWidget(self.refresh_button)
-        action_row.addWidget(self.work_in_button)
-        action_row.addWidget(self.work_out_button)
-        action_row.addWidget(self.exit_button)
-        details_layout.addLayout(action_row)
+        self._add_setting_row(session_card_layout, "출퇴근 제어", action_row)
 
-        self.login_spinner = QProgressBar(self)
+        self.login_spinner = QProgressBar(session_card)
         self.login_spinner.setRange(0, 0)
         self.login_spinner.setTextVisible(False)
         self.login_spinner.setFixedHeight(8)
         self.login_spinner.setVisible(False)
         self.login_spinner.setStyleSheet(
-            "QProgressBar { background: rgba(255,255,255,0.07); border: none; border-radius: 4px; }"
-            "QProgressBar::chunk { background: #4ec9f5; border-radius: 4px; }"
+            "QProgressBar { background: rgba(255,255,255,0.08); border: none; }"
+            "QProgressBar::chunk { background: #36e0ff; }"
         )
-        details_layout.addWidget(self.login_spinner)
+        self._add_setting_row(session_card_layout, "진행 상태", self.login_spinner)
 
         self.status_label = QLabel("접속하면 숨겨진 브라우저 세션이 시작됩니다.")
-        self.status_label.setFont(self._display_font(14))
-        self.status_label.setStyleSheet(f"color: rgba(255,255,255,0.78); font-family: '{self.font_family}';")
-        details_layout.addWidget(self.status_label, alignment=Qt.AlignHCenter)
+        self.status_label.setWordWrap(True)
+        self.status_label.setStyleSheet(
+            f"color: rgba(232,240,255,0.82); font-family: '{self.font_family}'; font-size: {self.settings_metrics['status_font_size']}px; background: transparent;"
+        )
+        self._add_setting_row(session_card_layout, "안내", self.status_label)
 
-        self.day_rows: list[DayRowWidget] = []
-        for day_name in DAY_NAMES:
-            row = DayRowWidget(day_name, self.font_family, self.details_panel)
-            self.day_rows.append(row)
-            details_layout.addWidget(row)
+        session_page_layout.addWidget(session_card, alignment=Qt.AlignCenter)
+        self.settings_stack.addWidget(session_page)
 
-        root.addWidget(self.details_panel, alignment=Qt.AlignHCenter)
-        self._apply_card_geometry()
-        self.adjustSize()
+        work_page = QWidget()
+        work_page_layout = QVBoxLayout(work_page)
+        work_page_layout.setContentsMargins(0, 0, 0, 0)
+        work_page_layout.setSpacing(0)
+        work_card, work_card_layout = self._create_settings_card("요일별 초과근무", "주간 근무 현황을 확인합니다")
+        self.weekly_table = WeeklyOvertimeTable(self.font_family, self.resolution_scale, work_card)
+        work_card_layout.addWidget(self.weekly_table)
+        work_page_layout.addWidget(work_card, alignment=Qt.AlignCenter)
+        self.settings_stack.addWidget(work_page)
 
+        options_page = QWidget()
+        options_page_layout = QVBoxLayout(options_page)
+        options_page_layout.setContentsMargins(0, 0, 0, 0)
+        options_page_layout.setSpacing(0)
+        options_card, options_card_layout = self._create_settings_card("환경 설정", "위젯 표시 방식과 갱신 주기")
+
+        self.headless_checkbox = QCheckBox("크롬 헤드리스")
+        self.always_on_top_checkbox = QCheckBox("항상 위에 표시")
+        for checkbox in (self.headless_checkbox, self.always_on_top_checkbox):
+            checkbox.setStyleSheet(self._settings_checkbox_style())
+        self.headless_checkbox.toggled.connect(self._on_headless_toggled)
+        self.always_on_top_checkbox.toggled.connect(self._on_always_on_top_toggled)
+        self._add_setting_row(options_card_layout, "브라우저", self.headless_checkbox)
+        self._add_setting_row(options_card_layout, "윈도우", self.always_on_top_checkbox)
+
+        card_opacity_row = QHBoxLayout()
+        card_opacity_row.setSpacing(12)
+        self.card_opacity_slider = QSlider(Qt.Horizontal)
+        self.card_opacity_slider.setRange(10, 90)
+        self.card_opacity_slider.valueChanged.connect(self._on_card_opacity_changed)
+        self.card_opacity_slider.setStyleSheet(self._slider_style())
+        self.card_opacity_slider.setMinimumHeight(26)
+        self.card_opacity_value_label = QLabel("50%")
+        self.card_opacity_value_label.setStyleSheet(self._settings_value_style())
+        card_opacity_row.addWidget(self.card_opacity_slider, 1)
+        card_opacity_row.addWidget(self.card_opacity_value_label)
+        self._add_setting_row(options_card_layout, "초과근무 UI 투명도", card_opacity_row)
+
+        ui_opacity_row = QHBoxLayout()
+        ui_opacity_row.setSpacing(12)
+        self.ui_opacity_slider = QSlider(Qt.Horizontal)
+        self.ui_opacity_slider.setRange(10, 90)
+        self.ui_opacity_slider.valueChanged.connect(self._on_ui_opacity_changed)
+        self.ui_opacity_slider.setStyleSheet(self._slider_style())
+        self.ui_opacity_slider.setMinimumHeight(26)
+        self.ui_opacity_value_label = QLabel("50%")
+        self.ui_opacity_value_label.setStyleSheet(self._settings_value_style())
+        ui_opacity_row.addWidget(self.ui_opacity_slider, 1)
+        ui_opacity_row.addWidget(self.ui_opacity_value_label)
+        self._add_setting_row(options_card_layout, "설정창 투명도", ui_opacity_row)
+
+        refresh_row = QHBoxLayout()
+        refresh_row.setSpacing(12)
+        self.refresh_interval_slider = QSlider(Qt.Horizontal)
+        self.refresh_interval_slider.setRange(10, 300)
+        self.refresh_interval_slider.valueChanged.connect(self._on_refresh_interval_changed)
+        self.refresh_interval_slider.setStyleSheet(self._slider_style())
+        self.refresh_interval_slider.setMinimumHeight(26)
+        self.refresh_interval_value_label = QLabel("10초")
+        self.refresh_interval_value_label.setStyleSheet(self._settings_value_style())
+        refresh_row.addWidget(self.refresh_interval_slider, 1)
+        refresh_row.addWidget(self.refresh_interval_value_label)
+        self._add_setting_row(options_card_layout, "새로고침 주기", refresh_row)
+
+        options_hint = QLabel("더블클릭으로 설정창을 열고 닫을 수 있습니다.")
+        options_hint.setWordWrap(True)
+        options_hint.setStyleSheet(
+            f"color: rgba(232,240,255,0.68); font-family: '{self.font_family}'; font-size: {self._scaled_metric('hint_font_size')}px; background: transparent;"
+        )
+        self._add_setting_row(options_card_layout, "도움말", options_hint)
+
+        options_page_layout.addWidget(options_card, alignment=Qt.AlignCenter)
+        self.settings_stack.addWidget(options_page)
+
+        chat_page = QWidget()
+        chat_page_layout = QVBoxLayout(chat_page)
+        chat_page_layout.setContentsMargins(0, 0, 0, 0)
+        chat_page_layout.setSpacing(0)
+        chat_card, chat_card_layout = self._create_settings_card("LAN 채팅", "같은 네트워크 안에서 자동으로 연결됩니다")
+
+        self.chat_enabled_checkbox = QCheckBox("로그인 시 자동 접속")
+        self.chat_enabled_checkbox.setStyleSheet(self._settings_checkbox_style())
+        self.chat_enabled_checkbox.toggled.connect(self._on_chat_enabled_toggled)
+        self._add_setting_row(chat_card_layout, "채팅 사용", self.chat_enabled_checkbox, label_width=self.settings_metrics["chat_row_label_width"])
+
+        self.chat_system_checkbox = QCheckBox("입장/퇴장 메시지 표시")
+        self.chat_system_checkbox.setStyleSheet(self._settings_checkbox_style())
+        self.chat_system_checkbox.toggled.connect(self._on_chat_system_messages_toggled)
+        self._add_setting_row(chat_card_layout, "시스템 메시지", self.chat_system_checkbox, label_width=self.settings_metrics["chat_row_label_width"])
+
+        self.chat_nickname_input = QLineEdit()
+        self.chat_nickname_input.setPlaceholderText("비우면 로그인 아이디 사용")
+        self.chat_nickname_input.setMinimumHeight(self._scaled_metric("input_height"))
+        self.chat_nickname_input.setFixedWidth(self._scaled_metric("input_width"))
+        self.chat_nickname_input.setStyleSheet(self._field_style())
+        self.chat_nickname_input.editingFinished.connect(self._on_chat_settings_edited)
+        self._add_setting_row(chat_card_layout, "닉네임", self.chat_nickname_input, label_width=self.settings_metrics["chat_row_label_width"])
+
+        self.chat_room_input = QLineEdit()
+        self.chat_room_input.setPlaceholderText("attendance-room")
+        self.chat_room_input.setMinimumHeight(self._scaled_metric("input_height"))
+        self.chat_room_input.setFixedWidth(self._scaled_metric("input_width"))
+        self.chat_room_input.setStyleSheet(self._field_style())
+        self.chat_room_input.editingFinished.connect(self._on_chat_settings_edited)
+        self._add_setting_row(chat_card_layout, "채팅방 이름", self.chat_room_input, label_width=self.settings_metrics["chat_row_label_width"])
+
+        self.chat_group_input = QLineEdit()
+        self.chat_group_input.setPlaceholderText("239.255.42.99")
+        self.chat_group_input.setMinimumHeight(self._scaled_metric("input_height"))
+        self.chat_group_input.setFixedWidth(self._scaled_metric("input_width"))
+        self.chat_group_input.setStyleSheet(self._field_style())
+        self.chat_group_input.editingFinished.connect(self._on_chat_settings_edited)
+        self._add_setting_row(chat_card_layout, "멀티캐스트 그룹", self.chat_group_input, label_width=self.settings_metrics["chat_row_label_width"])
+
+        self.chat_port_input = QLineEdit()
+        self.chat_port_input.setPlaceholderText("45454")
+        self.chat_port_input.setMinimumHeight(self._scaled_metric("input_height"))
+        self.chat_port_input.setFixedWidth(self._scaled_metric("single_button_width"))
+        self.chat_port_input.setStyleSheet(self._field_style())
+        self.chat_port_input.editingFinished.connect(self._on_chat_settings_edited)
+        self._add_setting_row(chat_card_layout, "포트", self.chat_port_input, label_width=self.settings_metrics["chat_row_label_width"])
+
+        chat_opacity_row = QHBoxLayout()
+        chat_opacity_row.setSpacing(12)
+        self.chat_opacity_slider = QSlider(Qt.Horizontal)
+        self.chat_opacity_slider.setRange(20, 100)
+        self.chat_opacity_slider.valueChanged.connect(self._on_chat_opacity_changed)
+        self.chat_opacity_slider.setStyleSheet(self._slider_style())
+        self.chat_opacity_slider.setMinimumHeight(26)
+        self.chat_opacity_value_label = QLabel("100%")
+        self.chat_opacity_value_label.setStyleSheet(self._settings_value_style())
+        chat_opacity_row.addWidget(self.chat_opacity_slider, 1)
+        chat_opacity_row.addWidget(self.chat_opacity_value_label)
+        self._add_setting_row(chat_card_layout, "채팅창 투명도", chat_opacity_row, label_width=self.settings_metrics["chat_row_label_width"])
+
+        chat_hide_row = QHBoxLayout()
+        chat_hide_row.setSpacing(12)
+        self.chat_hide_slider = QSlider(Qt.Horizontal)
+        self.chat_hide_slider.setRange(3, 30)
+        self.chat_hide_slider.valueChanged.connect(self._on_chat_hide_seconds_changed)
+        self.chat_hide_slider.setStyleSheet(self._slider_style())
+        self.chat_hide_slider.setMinimumHeight(26)
+        self.chat_hide_value_label = QLabel("8초")
+        self.chat_hide_value_label.setStyleSheet(self._settings_value_style())
+        chat_hide_row.addWidget(self.chat_hide_slider, 1)
+        chat_hide_row.addWidget(self.chat_hide_value_label)
+        self._add_setting_row(chat_card_layout, "자동 숨김", chat_hide_row, label_width=self.settings_metrics["chat_row_label_width"])
+
+        self.chat_reconnect_button = QPushButton("채팅 다시 연결")
+        self.chat_reconnect_button.setFixedHeight(self._scaled_metric("input_height"))
+        self.chat_reconnect_button.setFixedWidth(self._scaled_metric("single_button_width"))
+        self.chat_reconnect_button.setStyleSheet(self._action_button_style())
+        self.chat_reconnect_button.clicked.connect(self._reconnect_chat)
+        self._add_setting_row(chat_card_layout, "연결 제어", self.chat_reconnect_button, label_width=self.settings_metrics["chat_row_label_width"])
+
+        chat_page_layout.addWidget(chat_card, alignment=Qt.AlignCenter)
+        self.settings_stack.addWidget(chat_page)
+
+        self._resize_settings_window()
+        self._switch_settings_tab(0)
+        self.details_panel.hide()
+
+    def _build_chat_window(self) -> None:
+        self.chat_panel = QWidget(None)
+        self.chat_panel.setWindowTitle("LAN 채팅")
+        self.chat_panel.setWindowFlags(Qt.FramelessWindowHint | Qt.Tool | Qt.WindowStaysOnTopHint)
+        self.chat_panel.setAttribute(Qt.WA_TranslucentBackground)
+
+        root = QVBoxLayout(self.chat_panel)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+
+        self.chat_shell = QFrame(self.chat_panel)
+        self.chat_shell.setStyleSheet("QFrame { background: rgba(7, 12, 18, 230); border: 1px solid rgba(54,224,255,0.22); }")
+        shell_layout = QVBoxLayout(self.chat_shell)
+        shell_layout.setContentsMargins(14, 12, 14, 12)
+        shell_layout.setSpacing(8)
+
+        title_row = QHBoxLayout()
+        title_row.setContentsMargins(0, 0, 0, 0)
+        self.chat_title_label = QLabel("LAN CHAT", self.chat_shell)
+        self.chat_title_label.setStyleSheet(
+            f"color: #7aeaff; font-family: '{self.chat_font_family}'; font-size: {max(14, int(round(self.chat_metrics['title_font_size'] * self.resolution_scale)))}px; background: transparent;"
+        )
+        self.chat_state_label = QLabel("대기 중", self.chat_shell)
+        self.chat_state_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.chat_state_label.setStyleSheet(
+            f"color: rgba(232,240,255,0.68); font-family: '{self.chat_font_family}'; font-size: {max(11, int(round(self.chat_metrics['meta_font_size'] * self.resolution_scale)))}px; background: transparent;"
+        )
+        title_row.addWidget(self.chat_title_label)
+        title_row.addStretch(1)
+        title_row.addWidget(self.chat_state_label)
+        shell_layout.addLayout(title_row)
+
+        self.chat_history = QListWidget(self.chat_shell)
+        self.chat_history.setFocusPolicy(Qt.NoFocus)
+        self.chat_history.setSelectionMode(QListWidget.NoSelection)
+        self.chat_history.setWordWrap(True)
+        self.chat_history.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.chat_history.setTextElideMode(Qt.ElideNone)
+        self.chat_history.setWrapping(False)
+        self.chat_history.setStyleSheet(
+            f"QListWidget {{ background: rgba(0,0,0,0.16); color: rgba(242,247,255,0.95); border: none; outline: none; font-family: '{self.chat_font_family}'; font-size: {max(12, int(round(self.chat_metrics['message_font_size'] * self.resolution_scale)))}px; }}"
+            "QListWidget::item { padding: 4px 2px; border: none; }"
+        )
+        shell_layout.addWidget(self.chat_history, 1)
+
+        self.chat_input = ChatInputBox(self.chat_shell)
+        self.chat_input.setPlaceholderText("메시지를 입력하세요. Enter 전송 / Shift+Enter 줄바꿈 / Esc 닫기")
+        self.chat_input.setLineWrapMode(QPlainTextEdit.WidgetWidth)
+        self.chat_input.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.chat_input.setFixedHeight(max(52, int(round(self.chat_metrics['input_height'] * self.resolution_scale))))
+        self.chat_input.setStyleSheet(
+            f"QPlainTextEdit {{ background: rgba(241,246,255,0.96); color: #1a2533; border: none; padding: 8px 10px; font-family: '{self.chat_font_family}'; font-size: {max(12, int(round(self.chat_metrics['input_font_size'] * self.resolution_scale)))}px; }}"
+        )
+        self.chat_input.send_requested.connect(self._send_chat_message)
+        self.chat_input.dismissed.connect(self._hide_chat_panel)
+        shell_layout.addWidget(self.chat_input)
+
+        self.chat_hint_label = QLabel("Shift+Enter 로 열기", self.chat_shell)
+        self.chat_hint_label.setStyleSheet(
+            f"color: rgba(232,240,255,0.48); font-family: '{self.chat_font_family}'; font-size: {max(10, int(round(self.chat_metrics['meta_font_size'] * self.resolution_scale)))}px; background: transparent;"
+        )
+        shell_layout.addWidget(self.chat_hint_label)
+
+        root.addWidget(self.chat_shell)
+        self.chat_panel.hide()
+
+        self.chat_notice_panel = QWidget(None)
+        self.chat_notice_panel.setWindowTitle("채팅 알림")
+        self.chat_notice_panel.setWindowFlags(Qt.FramelessWindowHint | Qt.Tool | Qt.WindowStaysOnTopHint)
+        self.chat_notice_panel.setAttribute(Qt.WA_TranslucentBackground)
+        notice_root = QVBoxLayout(self.chat_notice_panel)
+        notice_root.setContentsMargins(0, 0, 0, 0)
+        self.chat_notice_shell = QFrame(self.chat_notice_panel)
+        self.chat_notice_shell.setStyleSheet("QFrame { background: rgba(7, 12, 18, 210); border: 1px solid rgba(255,255,255,0.08); }")
+        notice_layout = QVBoxLayout(self.chat_notice_shell)
+        notice_layout.setContentsMargins(12, 10, 12, 10)
+        notice_layout.setSpacing(4)
+        self.chat_notice_sender = QLabel("", self.chat_notice_shell)
+        self.chat_notice_sender.setStyleSheet(
+            f"color: #7aeaff; font-family: '{self.chat_font_family}'; font-size: {max(12, int(round(self.chat_metrics['message_font_size'] * self.resolution_scale)))}px; background: transparent;"
+        )
+        self.chat_notice_text = QLabel("", self.chat_notice_shell)
+        self.chat_notice_text.setWordWrap(True)
+        self.chat_notice_text.setStyleSheet(
+            f"color: #7aeaff; font-family: '{self.chat_font_family}'; font-size: {max(12, int(round(self.chat_metrics['message_font_size'] * self.resolution_scale)))}px; background: transparent;"
+        )
+        notice_layout.addWidget(self.chat_notice_sender)
+        notice_layout.addWidget(self.chat_notice_text)
+        notice_root.addWidget(self.chat_notice_shell)
+        self.chat_notice_panel.hide()
+
+        self.chat_hide_timer = QTimer(self)
+        self.chat_hide_timer.setSingleShot(True)
+        self.chat_hide_timer.timeout.connect(self._hide_chat_panel_if_idle)
+        self.chat_notice_timer = QTimer(self)
+        self.chat_notice_timer.setSingleShot(True)
+        self.chat_notice_timer.timeout.connect(self.chat_notice_panel.hide)
+
+        self.chat_shortcut = QShortcut(QKeySequence("Shift+Return"), self)
+        self.chat_shortcut.activated.connect(self._activate_chat_input)
+        self.details_chat_shortcut = QShortcut(QKeySequence("Shift+Return"), self.details_panel)
+        self.details_chat_shortcut.activated.connect(self._activate_chat_input)
+
+        self._position_chat_window()
+        self._position_chat_notice_window()
+
+    def _position_chat_window(self) -> None:
+        if not hasattr(self, "chat_panel"):
+            return
+        screen = QApplication.primaryScreen()
+        if screen is None:
+            width = int(round(self.chat_metrics["panel_width"] * self.resolution_scale))
+            height = int(round(self.chat_metrics["panel_height"] * self.resolution_scale))
+            self.chat_panel.setFixedSize(width, height)
+            self.chat_panel.move(int(round(self.chat_metrics["panel_left"] * self.resolution_scale)), 320)
+            return
+        available = screen.availableGeometry()
+        width = int(round(self.chat_metrics["panel_width"] * self.resolution_scale))
+        height = int(round(self.chat_metrics["panel_height"] * self.resolution_scale))
+        anchor_offset = int(round(self.chat_metrics["panel_anchor_y"] * self.resolution_scale))
+        left = available.left() + int(round(self.chat_metrics["panel_left"] * self.resolution_scale))
+        top = available.top() + int((available.height() - height) / 2) + anchor_offset
+        self.chat_panel.setGeometry(left, top, width, height)
+
+    def _position_chat_notice_window(self) -> None:
+        if not hasattr(self, "chat_notice_panel"):
+            return
+        screen = QApplication.primaryScreen()
+        width = int(round(self.chat_metrics["notice_width"] * self.resolution_scale))
+        height = int(round(self.chat_metrics["notice_height"] * self.resolution_scale))
+        if screen is None:
+            self.chat_notice_panel.setGeometry(
+                int(round(self.chat_metrics["notice_left"] * self.resolution_scale)),
+                320 + int(round((self.chat_metrics["panel_height"] + self.chat_metrics["notice_gap"]) * self.resolution_scale)),
+                width,
+                height,
+            )
+            return
+        available = screen.availableGeometry()
+        left = available.left() + int(round(self.chat_metrics["notice_left"] * self.resolution_scale))
+        top = available.top() + int((available.height() - int(round(self.chat_metrics["panel_height"] * self.resolution_scale))) / 2)
+        top += int(round((self.chat_metrics["panel_height"] + self.chat_metrics["notice_gap"]) * self.resolution_scale))
+        self.chat_notice_panel.setGeometry(left, top, width, height)
+
+    def _activate_chat_input(self) -> None:
+        if not hasattr(self, "chat_enabled_checkbox") or not self.chat_enabled_checkbox.isChecked() or not self.is_logged_in:
+            return
+        self._show_chat_panel(focus_input=True)
+
+    def _show_chat_panel(self, focus_input: bool = False) -> None:
+        self._position_chat_window()
+        self.chat_panel.show()
+        self.chat_panel.raise_()
+        self.chat_panel.activateWindow()
+        if focus_input:
+            self.chat_input.setFocus()
+        self._restart_chat_hide_timer()
+
+    def _hide_chat_panel_if_idle(self) -> None:
+        if self.chat_input.hasFocus():
+            self._restart_chat_hide_timer()
+            return
+        self._hide_chat_panel()
+
+    def _hide_chat_panel(self) -> None:
+        if hasattr(self, "chat_panel"):
+            self.chat_panel.hide()
+        if hasattr(self, "chat_notice_panel"):
+            self.chat_notice_panel.hide()
+        if hasattr(self, "chat_hide_timer"):
+            self.chat_hide_timer.stop()
+        if hasattr(self, "chat_notice_timer"):
+            self.chat_notice_timer.stop()
+
+    def _restart_chat_hide_timer(self) -> None:
+        if not hasattr(self, "chat_hide_timer"):
+            return
+        seconds = max(3, self.chat_hide_slider.value()) if hasattr(self, "chat_hide_slider") else 8
+        self.chat_hide_timer.start(seconds * 1000)
+
+    def _show_chat_notice(self, sender: str, text: str, color: str) -> None:
+        self._position_chat_notice_window()
+        self.chat_notice_sender.setText(sender)
+        self.chat_notice_text.setText(text)
+        style = f"color: {color}; font-family: '{self.chat_font_family}'; font-size: {max(12, int(round(self.chat_metrics['message_font_size'] * self.resolution_scale)))}px; background: transparent;"
+        self.chat_notice_sender.setStyleSheet(style)
+        self.chat_notice_text.setStyleSheet(style)
+        self.chat_notice_panel.show()
+        self.chat_notice_panel.raise_()
+        self.chat_notice_panel.activateWindow()
+        self.chat_notice_timer.start(max(3, self.chat_hide_slider.value()) * 1000)
+
+    def _chat_display_name(self) -> str:
+        nickname = self.chat_nickname_input.text().strip() if hasattr(self, "chat_nickname_input") else ""
+        if nickname:
+            return nickname
+        username = self.username_input.text().strip() if hasattr(self, "username_input") else ""
+        return username or "익명"
+
+    def _chat_config_from_ui(self) -> ChatConfig:
+        room = self.chat_room_input.text().strip() or "attendance-room"
+        group = self.chat_group_input.text().strip() or "239.255.42.99"
+        try:
+            port = int(self.chat_port_input.text().strip() or "45454")
+        except ValueError:
+            port = 45454
+        return ChatConfig(
+            nickname=self._chat_display_name(),
+            room=room,
+            multicast_group=group,
+            port=port,
+            system_messages=self.chat_system_checkbox.isChecked(),
+        )
+
+    def _connect_chat_if_needed(self) -> None:
+        if not hasattr(self, "chat_enabled_checkbox") or not self.chat_enabled_checkbox.isChecked() or not self.is_logged_in:
+            return
+        if self.chat_client is not None and self.chat_client.isRunning():
+            return
+        config = self._chat_config_from_ui()
+        self.chat_client = LanChatClient(config, self)
+        self.chat_client.message_received.connect(self._handle_chat_message)
+        self.chat_client.status_changed.connect(self._handle_chat_status)
+        self.chat_client.connection_changed.connect(self._handle_chat_connection_changed)
+        self.chat_client.error_occurred.connect(self._handle_chat_error)
+        self.chat_client.start()
+        self.chat_state_label.setText(f"{config.room} 연결 중")
+
+    def _disconnect_chat(self) -> None:
+        if self.chat_client is None:
+            return
+        client = self.chat_client
+        self.chat_client = None
+        client.stop()
+        self.chat_connected = False
+        if hasattr(self, "chat_state_label"):
+            self.chat_state_label.setText("연결 안 됨")
+        self._hide_chat_panel()
+
+    def _reconnect_chat(self) -> None:
+        self._persist_chat_preferences()
+        self._disconnect_chat()
+        if self.is_logged_in and self.chat_enabled_checkbox.isChecked():
+            self._connect_chat_if_needed()
+
+    def _persist_chat_preferences(self) -> None:
+        self.qt_settings.setValue("chat_enabled", self.chat_enabled_checkbox.isChecked())
+        self.qt_settings.setValue("chat_system_messages", self.chat_system_checkbox.isChecked())
+        self.qt_settings.setValue("chat_nickname", self.chat_nickname_input.text().strip())
+        self.qt_settings.setValue("chat_room", self.chat_room_input.text().strip())
+        self.qt_settings.setValue("chat_group", self.chat_group_input.text().strip())
+        self.qt_settings.setValue("chat_port", self.chat_port_input.text().strip())
+        self.qt_settings.setValue("chat_hide_seconds", self.chat_hide_slider.value())
+        self.qt_settings.setValue("chat_panel_opacity", self.chat_opacity_slider.value())
+        self.qt_settings.sync()
+
+    def _wrap_chat_text(self, text: str) -> str:
+        available_width = max(180, self.chat_history.viewport().width() - 24) if hasattr(self, "chat_history") else 320
+        font_size = max(12, int(round(self.chat_metrics['message_font_size'] * self.resolution_scale)))
+        approx_char_width = max(7, int(font_size * 0.75))
+        chars_per_line = max(12, available_width // approx_char_width)
+
+        wrapped_lines: list[str] = []
+        for raw_line in text.splitlines() or [text]:
+            line = raw_line
+            while len(line) > chars_per_line:
+                split_at = line.rfind(' ', 0, chars_per_line)
+                if split_at <= 0:
+                    split_at = chars_per_line
+                wrapped_lines.append(line[:split_at].rstrip())
+                line = line[split_at:].lstrip()
+            wrapped_lines.append(line)
+        return "\n".join(wrapped_lines)
+
+    def _append_chat_entry(self, sender: str, text: str, system: bool = False, timestamp: float | None = None, color: str | None = None) -> None:
+        when = datetime.fromtimestamp(timestamp) if timestamp else datetime.now()
+        prefix = when.strftime("%H:%M")
+        if system:
+            line = self._wrap_chat_text(f"[{prefix}] {text}")
+        else:
+            line = self._wrap_chat_text(f"[{prefix}] {sender}: {text}")
+        item = QListWidgetItem(line)
+        item.setForeground(QColor(color or ("#7aeaff" if not system else "#7aeaff")))
+        item.setSizeHint(item.sizeHint())
+        self.chat_history.addItem(item)
+        while self.chat_history.count() > 60:
+            self.chat_history.takeItem(0)
+        self.chat_history.scrollToBottom()
+
+    def _send_chat_message(self, text: str) -> None:
+        if not text.strip():
+            return
+        self._connect_chat_if_needed()
+        if self.chat_client is None:
+            self._handle_chat_error("채팅 연결을 시작할 수 없습니다.")
+            return
+        self.chat_client.send_chat(text)
+        self._append_chat_entry(self._chat_display_name(), text, system=False, color="#00b0e6")
+        self._show_chat_panel(focus_input=True)
+
+    def _handle_chat_message(self, message: dict) -> None:
+        message_type = message.get("type")
+        sender = str(message.get("sender", "알 수 없음"))
+        timestamp = float(message.get("timestamp", 0) or 0)
+        if message_type == "system":
+            if not self.chat_system_checkbox.isChecked():
+                return
+            event = message.get("event")
+            if event == "join":
+                text = f"{sender}님이 입장하셨습니다"
+                color = "#57d66b"
+            elif event == "leave":
+                text = f"{sender}님이 퇴장하셨습니다"
+                color = "#ff5a5a"
+            else:
+                text = f"{sender} 시스템 메시지"
+                color = "#8fefff"
+            self._append_chat_entry("시스템", text, system=True, timestamp=timestamp, color=color)
+            self._show_chat_notice("시스템", text, color)
+            return
+
+        chat_text = str(message.get("text", ""))
+        self._append_chat_entry(sender, chat_text, system=False, timestamp=timestamp, color="#8fefff")
+        self._show_chat_notice(sender, chat_text, "#8fefff")
+
+    def _handle_chat_status(self, status: str) -> None:
+        self.chat_state_label.setText(status)
+
+    def _handle_chat_connection_changed(self, connected: bool) -> None:
+        was_connected = self.chat_connected
+        self.chat_connected = connected
+        self.chat_state_label.setText("연결됨" if connected else "연결 안 됨")
+        self.chat_reconnect_button.setEnabled(self.chat_enabled_checkbox.isChecked())
+        if connected and not was_connected:
+            self._append_chat_entry("시스템", f"{self._chat_display_name()} 님이 입장하셨습니다", system=True, color="#57d66b")
+        elif not connected and was_connected:
+            self._append_chat_entry("시스템", f"{self._chat_display_name()} 님이 퇴장하셨습니다", system=True, color="#ff5a5a")
+    def _handle_chat_error(self, message: str) -> None:
+        self.chat_state_label.setText("오류")
+        self._append_chat_entry("시스템", message, system=True, color="#ff9b5c")
+        self._show_chat_notice("시스템", message, "#ff9b5c")
+    def _on_chat_enabled_toggled(self, checked: bool) -> None:
+        self.chat_reconnect_button.setEnabled(checked)
+        self.qt_settings.setValue("chat_enabled", checked)
+        if checked and self.is_logged_in:
+            self._connect_chat_if_needed()
+        elif not checked:
+            self._disconnect_chat()
+
+    def _on_chat_system_messages_toggled(self, checked: bool) -> None:
+        self.qt_settings.setValue("chat_system_messages", checked)
+        if self.chat_client is not None and self.chat_client.isRunning():
+            self._reconnect_chat()
+
+    def _on_chat_settings_edited(self) -> None:
+        self._persist_chat_preferences()
+        if self.chat_client is not None and self.chat_client.isRunning() and self.chat_enabled_checkbox.isChecked():
+            self._reconnect_chat()
+
+    def _on_chat_hide_seconds_changed(self, value: int) -> None:
+        value = max(3, min(30, value))
+        self.chat_hide_value_label.setText(f"{value}초")
+        self.qt_settings.setValue("chat_hide_seconds", value)
+        self._restart_chat_hide_timer()
+
+    def _on_chat_opacity_changed(self, value: int) -> None:
+        value = max(20, min(100, value))
+        self.chat_panel.setWindowOpacity(value / 100)
+        self.chat_opacity_value_label.setText(f"{value}%")
+        self.qt_settings.setValue("chat_panel_opacity", value)
+
+    def _create_settings_card(self, title: str, subtitle: str) -> tuple[QFrame, QVBoxLayout]:
+        card = QFrame(self.details_panel)
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(10)
+
+        title_label = QLabel(title, card)
+        title_label.setStyleSheet(
+            f"color: #7aeaff; font-family: '{self.font_family}'; font-size: {self._scaled_metric('section_title_font_size')}px; font-weight: 400; background: transparent;"
+        )
+        layout.addWidget(title_label)
+
+        subtitle_label = QLabel(subtitle, card)
+        subtitle_label.setStyleSheet(
+            f"color: rgba(232,240,255,0.72); font-family: '{self.font_family}'; font-size: {self._scaled_metric('section_subtitle_font_size')}px; background: transparent;"
+        )
+        layout.addWidget(subtitle_label)
+
+        self.settings_cards.append(card)
+        return card, layout
+
+    def _add_setting_row(self, parent_layout: QVBoxLayout, label_text: str, control, compact: bool = False, label_width: int | None = None) -> None:
+        row = QFrame(self.details_panel)
+        row.setObjectName("settingRow")
+        row.setStyleSheet(self._row_panel_style())
+        row_layout = QHBoxLayout(row)
+        row_layout.setContentsMargins(16, 10 if compact else 12, 16, 10 if compact else 12)
+        row_layout.setSpacing(16)
+
+        label = QLabel(label_text, row)
+        label.setStyleSheet(self._settings_label_style())
+        if label_width is None:
+            label.setMinimumWidth(self._scaled_metric("row_label_width_compact") if compact else self._scaled_metric("row_label_width"))
+        else:
+            label.setMinimumWidth(max(1, int(round(label_width * self.resolution_scale))))
+        row_layout.addWidget(label, 0, Qt.AlignVCenter)
+
+        if isinstance(control, QWidget):
+            if control.minimumWidth() > 0 or control.maximumWidth() < 16777215:
+                row_layout.addWidget(control, 0, Qt.AlignLeft | Qt.AlignVCenter)
+                row_layout.addStretch(1)
+            else:
+                row_layout.addWidget(control, 1)
+        else:
+            row_layout.addLayout(control, 1)
+
+        parent_layout.addWidget(row)
+
+    def _settings_label_style(self) -> str:
+        return (
+            f"color: rgba(232,240,255,0.92); font-family: '{self.font_family}'; "
+            f"font-size: {self._scaled_metric('row_label_font_size')}px; background: transparent;"
+        )
+
+    def _settings_value_style(self) -> str:
+        return (
+            f"color: #d9f8ff; font-family: '{self.font_family}'; "
+            f"font-size: {self._scaled_metric('row_value_font_size')}px; min-width: 56px; background: transparent;"
+        )
+
+    def _row_panel_style(self) -> str:
+        return "QFrame { background: rgba(7, 12, 18, 210); border: none; border-radius: 0px; }"
+
+    def _settings_checkbox_style(self) -> str:
+        return (
+            f"QCheckBox {{ color: rgba(232,240,255,0.92); font-family: '{self.font_family}'; font-size: {self._scaled_metric('checkbox_font_size')}px; spacing: 10px; background: transparent; }}"
+            "QCheckBox::indicator { width: 16px; height: 16px; border: 1px solid rgba(255,255,255,0.35); background: rgba(255,255,255,0.06); }"
+            "QCheckBox::indicator:checked { background: #38e4ff; border-color: #38e4ff; }"
+        )
+
+    def _slider_style(self) -> str:
+        return (
+            "QSlider::groove:horizontal { height: 6px; background: rgba(255,255,255,0.14); }"
+            "QSlider::sub-page:horizontal { background: #39e6ff; }"
+            "QSlider::handle:horizontal { width: 14px; margin: -5px 0; background: #f3fbff; border: 1px solid rgba(15,24,36,0.45); }"
+        )
+
+    def _accent_button_style(self) -> str:
+        return (
+            f"QPushButton {{ background: #36e0ff; color: #102030; border: none; padding: 8px 18px; font-family: '{self.font_family}'; font-size: {self._scaled_metric('button_font_size')}px; }}"
+            "QPushButton:hover { background: #72ecff; }"
+            "QPushButton:disabled { background: rgba(54,224,255,0.25); color: rgba(16,32,48,0.55); }"
+        )
+
+    def _action_button_style(self) -> str:
+        return (
+            f"QPushButton {{ background: rgba(255,255,255,0.08); color: rgba(235,243,255,0.94); border: 1px solid rgba(255,255,255,0.08); padding: 8px 18px; font-family: '{self.font_family}'; font-size: {self._scaled_metric('action_button_font_size')}px; }}"
+            "QPushButton:hover { background: rgba(255,255,255,0.16); }"
+            "QPushButton:disabled { background: rgba(255,255,255,0.04); color: rgba(255,255,255,0.3); }"
+        )
+
+    def _field_style(self, font_size_key: str = "field_font_size") -> str:
+        font_size = int(round(self.settings_metrics.get(font_size_key, self.settings_metrics["field_font_size"]) * self.resolution_scale))
+        return (
+            f"QLineEdit {{ background: rgba(241,246,255,0.96); color: #1a2533; border: none; padding: 8px 12px; font-family: '{self.font_family}'; font-size: {font_size}px; }}"
+            "QLineEdit::placeholder { color: rgba(26,37,51,0.45); }"
+        )
+
+    def _switch_settings_tab(self, index: int) -> None:
+        self.settings_stack.setCurrentIndex(index)
+        for idx, button in enumerate(self.settings_tab_buttons):
+            active = idx == index
+            button.setChecked(active)
+            button.setStyleSheet(
+                f"QPushButton {{ background: {'#36e0ff' if active else 'rgba(25,37,54,0.88)'}; color: {'#112236' if active else 'rgba(236,244,255,0.82)'}; border: none; padding: 8px 16px; font-family: '{self.font_family}'; font-size: {self._scaled_metric('tab_font_size')}px; }}"
+                f"QPushButton:hover {{ background: {'#5ce8ff' if active else 'rgba(36,52,74,0.96)'}; }}"
+            )
+        self._update_settings_hit_region()
+
+    def _scaled_decoration_pixmap(self, pixmap: QPixmap, scale: float) -> QPixmap:
+        if pixmap.isNull():
+            return QPixmap()
+        width = max(1, int(pixmap.width() * scale * self.resolution_scale))
+        height = max(1, int(pixmap.height() * scale * self.resolution_scale))
+        return pixmap.scaled(width, height, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+
+    def _layout_hud_decorations(self) -> None:
+        overlay_size = self.details_panel.size()
+
+        left_thumb = self._scaled_decoration_pixmap(self.hog_thumb_pixmap, self.hud_metrics["left_thumb_scale"])
+        left_hp = self._scaled_decoration_pixmap(self.hp_icon_pixmap, self.hud_metrics["left_hp_scale"])
+        center_q = self._scaled_decoration_pixmap(self.q_skill_pixmap, self.hud_metrics["center_q_scale"])
+        right_skill = self._scaled_decoration_pixmap(self.hog_skill_pixmap, self.hud_metrics["right_skill_scale"])
+        right_gun = self._scaled_decoration_pixmap(self.hog_gun_pixmap, self.hud_metrics["right_gun_scale"])
+
+        self.left_hud_thumb.setPixmap(left_thumb)
+        self.left_hud_hp.setPixmap(left_hp)
+        self.center_hud_q.setPixmap(center_q)
+        self.right_hud_skill.setPixmap(right_skill)
+        self.right_hud_gun.setPixmap(right_gun)
+
+        if not left_thumb.isNull():
+            self.left_hud_thumb.resize(left_thumb.size())
+            self.left_hud_thumb.move(self._scaled_hud_metric("left_thumb_padding_x"), overlay_size.height() - self._scaled_hud_metric("left_thumb_padding_y") - left_thumb.height())
+        if not left_hp.isNull():
+            self.left_hud_hp.resize(left_hp.size())
+            hp_x = self._scaled_hud_metric("left_thumb_padding_x") + self.left_hud_thumb.width() + self._scaled_hud_metric("left_hp_gap") + self._scaled_hud_metric("left_hp_padding_x")
+            hp_y = overlay_size.height() - self._scaled_hud_metric("left_hp_padding_y") - left_hp.height()
+            self.left_hud_hp.move(hp_x, hp_y)
+
+        if not center_q.isNull():
+            self.center_hud_q.resize(center_q.size())
+            center_x = int((overlay_size.width() - center_q.width()) / 2 + self._scaled_hud_metric("center_q_offset_x"))
+            center_y = overlay_size.height() - self._scaled_hud_metric("center_q_padding_y") - center_q.height()
+            self.center_hud_q.move(center_x, center_y)
+
+        if not right_gun.isNull():
+            self.right_hud_gun.resize(right_gun.size())
+            gun_x = overlay_size.width() - self._scaled_hud_metric("right_gun_padding_x") - right_gun.width()
+            gun_y = overlay_size.height() - self._scaled_hud_metric("right_gun_padding_y") - right_gun.height()
+            self.right_hud_gun.move(gun_x, gun_y)
+        if not right_skill.isNull():
+            self.right_hud_skill.resize(right_skill.size())
+            skill_x = self.right_hud_gun.x() - self._scaled_hud_metric("right_gun_gap") - right_skill.width() if not right_gun.isNull() else overlay_size.width() - self._scaled_hud_metric("right_skill_padding_x") - right_skill.width()
+            skill_x -= self._scaled_hud_metric("right_skill_padding_x") if not right_gun.isNull() else 0
+            skill_y = overlay_size.height() - self._scaled_hud_metric("right_skill_padding_y") - right_skill.height()
+            self.right_hud_skill.move(skill_x, skill_y)
+
+    def _resize_settings_window(self) -> None:
+        screen = QApplication.primaryScreen()
+        if screen is None:
+            self.details_panel.setFixedSize(int(1280 * self.resolution_scale), int(720 * self.resolution_scale))
+            self.settings_stack.setFixedWidth(int(760 * self.resolution_scale))
+            self._layout_hud_decorations()
+            self._position_chat_window()
+            self._position_chat_notice_window()
+            return
+        available = screen.availableGeometry()
+        self.details_panel.setGeometry(available)
+        card_width = max(int(620 * self.resolution_scale), min(int(860 * self.resolution_scale), int(available.width() * 0.46)))
+        self.settings_stack.setFixedWidth(card_width)
+        for card in self.settings_cards:
+            card.setFixedWidth(card_width)
+        self._layout_hud_decorations()
+        self._position_chat_window()
+        self._position_chat_notice_window()
+        self._update_settings_hit_region()
+
+    def _position_settings_window(self) -> None:
+        screen = QApplication.primaryScreen()
+        if screen is None:
+            return
+        available = screen.availableGeometry()
+        self.details_panel.setGeometry(available)
+        self._resize_settings_window()
+        self._update_settings_hit_region()
+
+    def _update_settings_hit_region(self) -> None:
+        if not self.details_panel.isVisible():
+            self.details_panel.clearMask()
+            return
+        region = QRegion()
+        for widget in [self.settings_header, self.settings_stack.currentWidget(), self.left_hud_thumb, self.left_hud_hp, self.center_hud_q, self.right_hud_skill, self.right_hud_gun]:
+            if widget is None or not widget.isVisible():
+                continue
+            top_left = widget.mapTo(self.details_panel, QPoint(0, 0))
+            region = region.united(QRegion(widget.rect().translated(top_left)))
+            for child in widget.findChildren(QWidget):
+                if not child.isVisible() or child.parentWidget() is None:
+                    continue
+                child_top_left = child.mapTo(self.details_panel, QPoint(0, 0))
+                region = region.united(QRegion(child.rect().translated(child_top_left)))
+        self.details_panel.setMask(region)
 
     def _apply_details_background(self, opacity_percent: int) -> None:
         opacity_percent = max(10, min(90, opacity_percent))
-        background_percent = opacity_percent * (80 / 90)
-        alpha = int(255 * (background_percent / 100))
-        self.details_panel.setStyleSheet(
-            f"QFrame {{ background: rgba(0,0,0,{alpha}); border: none; border-radius: 14px; }}"
-            f"QLabel {{ color: white; font-family: '{self.font_family}'; font-weight: 400; }}"
-            f"QPushButton {{ background: rgba(255,255,255,0.12); color: white; border: none; border-radius: 8px; padding: 10px 12px; font-family: '{self.font_family}'; font-weight: 400; font-size: 15px; }}"
-            "QPushButton:hover { background: rgba(255,255,255,0.2); }"
-            "QPushButton:disabled { background: rgba(255,255,255,0.06); color: rgba(255,255,255,0.35); }"
-            f"QCheckBox {{ color: white; font-family: '{self.font_family}'; font-weight: 400; font-size: 14px; }}"
-        )
+        row_alpha = int(160 + (opacity_percent / 90) * 70)
+        for card in self.settings_cards:
+            card.setStyleSheet("QFrame { background: transparent; border: none; }")
+        for row in self.details_panel.findChildren(QFrame, "settingRow"):
+            row.setStyleSheet(
+                f"QFrame#settingRow {{ background: rgba(7, 12, 18, {row_alpha}); border: none; border-radius: 0px; }}"
+            )
+        self.details_panel.update()
 
     def _format_refresh_interval(self, seconds: int) -> str:
         if seconds >= 60:
@@ -478,12 +1528,18 @@ class AttendanceWidget(QWidget):
         self.always_on_top_checkbox.setChecked(bool(saved_always_on_top))
         self._apply_window_flags(bool(saved_always_on_top))
 
-        saved_opacity = self.qt_settings.value("window_opacity", 90, type=int)
-        saved_opacity = max(10, min(90, int(saved_opacity)))
-        self.opacity_slider.setValue(saved_opacity)
-        self.setWindowOpacity(saved_opacity / 100)
-        self._apply_details_background(saved_opacity)
-        self.opacity_value_label.setText(f"{saved_opacity}%")
+        saved_card_opacity = self.qt_settings.value("card_window_opacity", 90, type=int)
+        saved_card_opacity = max(10, min(90, int(saved_card_opacity)))
+        self.card_opacity_slider.setValue(saved_card_opacity)
+        self.setWindowOpacity(saved_card_opacity / 100)
+        self.card_opacity_value_label.setText(f"{saved_card_opacity}%")
+
+        saved_ui_opacity = self.qt_settings.value("ui_window_opacity", 90, type=int)
+        saved_ui_opacity = max(10, min(90, int(saved_ui_opacity)))
+        self.ui_opacity_slider.setValue(saved_ui_opacity)
+        self.details_panel.setWindowOpacity(saved_ui_opacity / 100)
+        self._apply_details_background(saved_ui_opacity)
+        self.ui_opacity_value_label.setText(f"{saved_ui_opacity}%")
 
         saved_interval = self.qt_settings.value("refresh_interval_seconds", 10, type=int)
         saved_interval = max(10, min(300, int(saved_interval)))
@@ -491,13 +1547,30 @@ class AttendanceWidget(QWidget):
         self.refresh_timer.setInterval(saved_interval * 1000)
         self.refresh_interval_value_label.setText(self._format_refresh_interval(saved_interval))
 
+        self.chat_enabled_checkbox.setChecked(self.qt_settings.value("chat_enabled", True, type=bool))
+        self.chat_system_checkbox.setChecked(self.qt_settings.value("chat_system_messages", True, type=bool))
+        self.chat_nickname_input.setText(self.qt_settings.value("chat_nickname", "", type=str) or "")
+        self.chat_room_input.setText(self.qt_settings.value("chat_room", "attendance-room", type=str) or "attendance-room")
+        self.chat_group_input.setText(self.qt_settings.value("chat_group", "239.255.42.99", type=str) or "239.255.42.99")
+        self.chat_port_input.setText(self.qt_settings.value("chat_port", "45454", type=str) or "45454")
+        saved_chat_hide = max(3, min(30, int(self.qt_settings.value("chat_hide_seconds", 8, type=int))))
+        self.chat_hide_slider.setValue(saved_chat_hide)
+        self.chat_hide_value_label.setText(f"{saved_chat_hide}초")
+        saved_chat_opacity = max(20, min(100, int(self.qt_settings.value("chat_panel_opacity", 92, type=int))))
+        self.chat_opacity_slider.setValue(saved_chat_opacity)
+        self.chat_panel.setWindowOpacity(saved_chat_opacity / 100)
+        self.chat_opacity_value_label.setText(f"{saved_chat_opacity}%")
+        self.chat_reconnect_button.setEnabled(self.chat_enabled_checkbox.isChecked())
+
     def _save_preferences(self) -> None:
         self.qt_settings.setValue("username", self.username_input.text().strip())
         self.qt_settings.setValue("password", self.password_input.text())
         self.qt_settings.setValue("headless", self.headless_checkbox.isChecked())
         self.qt_settings.setValue("always_on_top", self.always_on_top_checkbox.isChecked())
-        self.qt_settings.setValue("window_opacity", self.opacity_slider.value())
+        self.qt_settings.setValue("card_window_opacity", self.card_opacity_slider.value())
+        self.qt_settings.setValue("ui_window_opacity", self.ui_opacity_slider.value())
         self.qt_settings.setValue("refresh_interval_seconds", self.refresh_interval_slider.value())
+        self._persist_chat_preferences()
         self.qt_settings.sync()
 
     def _on_headless_toggled(self, checked: bool) -> None:
@@ -510,12 +1583,18 @@ class AttendanceWidget(QWidget):
         self.qt_settings.setValue("always_on_top", checked)
         self.qt_settings.sync()
 
-    def _on_opacity_changed(self, value: int) -> None:
+    def _on_card_opacity_changed(self, value: int) -> None:
         value = max(10, min(90, value))
         self.setWindowOpacity(value / 100)
+        self.card_opacity_value_label.setText(f"{value}%")
+        self.qt_settings.setValue("card_window_opacity", value)
+
+    def _on_ui_opacity_changed(self, value: int) -> None:
+        value = max(10, min(90, value))
+        self.details_panel.setWindowOpacity(value / 100)
         self._apply_details_background(value)
-        self.opacity_value_label.setText(f"{value}%")
-        self.qt_settings.setValue("window_opacity", value)
+        self.ui_opacity_value_label.setText(f"{value}%")
+        self.qt_settings.setValue("ui_window_opacity", value)
 
     def _on_refresh_interval_changed(self, value: int) -> None:
         value = max(10, min(300, value))
@@ -525,17 +1604,31 @@ class AttendanceWidget(QWidget):
 
     def close_and_exit(self) -> None:
         self.refresh_timer.stop()
+        self._disconnect_chat()
         self.shutdown_requested.emit()
         self.session_thread.quit()
         self.session_thread.wait(2000)
+        if self.details_panel is not None:
+            self.details_panel.close()
+        if hasattr(self, "chat_panel") and self.chat_panel is not None:
+            self.chat_panel.close()
+        if hasattr(self, "chat_notice_panel") and self.chat_notice_panel is not None:
+            self.chat_notice_panel.close()
         self.close()
         QApplication.quit()
 
     def closeEvent(self, event) -> None:
         self.refresh_timer.stop()
+        self._disconnect_chat()
         self.shutdown_requested.emit()
         self.session_thread.quit()
         self.session_thread.wait(2000)
+        if self.details_panel is not None:
+            self.details_panel.close()
+        if hasattr(self, "chat_panel") and self.chat_panel is not None:
+            self.chat_panel.close()
+        if hasattr(self, "chat_notice_panel") and self.chat_notice_panel is not None:
+            self.chat_notice_panel.close()
         super().closeEvent(event)
 
     def login_to_site(self) -> None:
@@ -632,8 +1725,8 @@ class AttendanceWidget(QWidget):
 
     def _update_score_card(self, balance_minutes: int) -> None:
         self.current_balance_minutes = balance_minutes
-        self.score_text_left = f"{self._format_duration(abs(min(balance_minutes, 0)))}%"
-        self.score_text_right = f"{self._format_duration(max(balance_minutes, 0))}%"
+        self.score_text_left = f"{self._format_duration(abs(min(balance_minutes, 0)))}"
+        self.score_text_right = f"{self._format_duration(max(balance_minutes, 0))}"
         base_pixmap = self.red_bg if balance_minutes >= 0 else self.blue_bg
         if self.card_loading:
             self.card_pixmap = self.red_bg_dim if balance_minutes >= 0 else self.blue_bg_dim
@@ -642,9 +1735,9 @@ class AttendanceWidget(QWidget):
 
         if balance_minutes >= 0:
             self.score_label_left.setStyleSheet("color: rgb(0,200,220); background: transparent;")
-            self.score_label_right.setStyleSheet("color: black; background: transparent;")
+            self.score_label_right.setStyleSheet("color: white; background: transparent;")
         else:
-            self.score_label_left.setStyleSheet("color: black; background: transparent;")
+            self.score_label_left.setStyleSheet("color: white; background: transparent;")
             self.score_label_right.setStyleSheet("color: rgb(220,2,5); background: transparent;")
 
         self.score_label_left.setText(self.score_text_left)
@@ -654,54 +1747,114 @@ class AttendanceWidget(QWidget):
     def _update_day_rows(self, snapshot: AttendanceSnapshot) -> None:
         rows_by_date = {row.date: row for row in snapshot.weekly_rows}
         target_dates = week_date_strings(date.today())
-        day_data: list[tuple[int, str, str]] = []
-        for day_key in target_dates:
+        day_data: list[dict[str, object]] = []
+        for order_index, (day_name, day_key) in enumerate(zip(DAY_NAMES, target_dates)):
             row = rows_by_date.get(day_key)
             if row is None:
-                day_data.append((0, "--:--", "--:--"))
+                day_data.append(
+                    {
+                        'day_name': day_name,
+                        'balance_minutes': 0,
+                        'come_time': '--:--',
+                        'leave_time': '--:--',
+                        'order_index': order_index,
+                    }
+                )
                 continue
             come_time, leave_time = normalize_times(row, self.settings.default_start, self.settings.default_end)
             worked = worked_minutes(come_time, leave_time)
             expected = target_minutes_for_label(row.label, self.settings.weekday_target_minutes, self.settings.halfday_target_minutes)
             balance_minutes = worked - expected
-            day_data.append((balance_minutes, self._format_clock(come_time), self._format_clock(leave_time)))
+            day_data.append(
+                {
+                    'day_name': day_name,
+                    'balance_minutes': balance_minutes,
+                    'come_time': self._format_clock(come_time),
+                    'leave_time': self._format_clock(leave_time),
+                    'order_index': order_index,
+                }
+            )
 
-        max_minutes = max((abs(balance) for balance, _, _ in day_data), default=1)
-        max_minutes = max(max_minutes, 1)
-        for row_widget, (balance_minutes, come_time, leave_time) in zip(self.day_rows, day_data):
-            row_widget.set_row_data(balance_minutes, come_time, leave_time, max_minutes)
+        self.weekly_table.set_rows(day_data)
 
     def _toggle_details(self, checked: bool) -> None:
         self.details_panel.setVisible(checked)
+        if checked:
+            self._position_settings_window()
+            self.details_panel.raise_()
+            self.details_panel.activateWindow()
+        self._refresh_details_layout()
+
+    def _refresh_details_layout(self) -> None:
+        if self.details_panel.isVisible():
+            self.details_panel.adjustSize()
+            self._position_settings_window()
+            self.details_panel.update()
         self.adjustSize()
         self.update()
 
     def _apply_window_flags(self, always_on_top: bool) -> None:
         geometry = self.geometry()
         was_visible = self.isVisible()
+        details_visible = self.details_panel.isVisible()
         self.setWindowFlag(Qt.FramelessWindowHint, True)
+        self.setWindowFlag(Qt.Tool, True)
         self.setWindowFlag(Qt.WindowStaysOnTopHint, always_on_top)
+        self.details_panel.setWindowFlag(Qt.FramelessWindowHint, True)
+        self.details_panel.setWindowFlag(Qt.Tool, True)
+        self.details_panel.setWindowFlag(Qt.WindowStaysOnTopHint, always_on_top)
+        if hasattr(self, "chat_panel"):
+            self.chat_panel.setWindowFlag(Qt.FramelessWindowHint, True)
+            self.chat_panel.setWindowFlag(Qt.Tool, True)
+            self.chat_panel.setWindowFlag(Qt.WindowStaysOnTopHint, always_on_top)
+        if hasattr(self, "chat_notice_panel"):
+            self.chat_notice_panel.setWindowFlag(Qt.FramelessWindowHint, True)
+            self.chat_notice_panel.setWindowFlag(Qt.Tool, True)
+            self.chat_notice_panel.setWindowFlag(Qt.WindowStaysOnTopHint, always_on_top)
         if was_visible:
             self.show()
             self.setGeometry(geometry)
+        if details_visible:
+            self.details_panel.show()
+            self._position_settings_window()
+        if hasattr(self, "chat_panel") and self.chat_panel.isVisible():
+            self.chat_panel.show()
+            self._position_chat_window()
+        if hasattr(self, "chat_notice_panel") and self.chat_notice_panel.isVisible():
+            self.chat_notice_panel.show()
+            self._position_chat_notice_window()
+            self._position_chat_notice_window()
 
     def _apply_card_geometry(self) -> None:
         active_pixmap = self.card_pixmap if not self.card_pixmap.isNull() else self.blue_bg
-        scaled_width = int(active_pixmap.width() * 0.3 * self.scale) if not active_pixmap.isNull() else 260
-        scaled_height = int(active_pixmap.height() * 0.3 * self.scale) if not active_pixmap.isNull() else 90
+        image_scale = self.card_metrics["image_scale"]
+        effective_scale = self.scale * self.resolution_scale
+        scaled_width = int(active_pixmap.width() * image_scale * effective_scale) if not active_pixmap.isNull() else int(260 * self.resolution_scale)
+        scaled_height = int(active_pixmap.height() * image_scale * effective_scale) if not active_pixmap.isNull() else int(90 * self.resolution_scale)
         self.card.setFixedSize(scaled_width, scaled_height)
-        self.details_panel.setFixedWidth(scaled_width)
+        self.setFixedSize(scaled_width, scaled_height)
 
         if not active_pixmap.isNull():
             scaled = active_pixmap.scaled(scaled_width, scaled_height, Qt.KeepAspectRatio, Qt.SmoothTransformation)
             self.bg_label.setPixmap(scaled)
             self.bg_label.setGeometry(0, 0, scaled_width, scaled_height)
 
-        score_font = self._display_font(max(12, int(25 * self.scale)), italic=True)
+        effective_scale = self.scale * self.resolution_scale
+        score_font = self._display_font(max(12, int(25 * effective_scale)), italic=True)
         self.score_label_left.setFont(score_font)
         self.score_label_right.setFont(score_font)
-        self.score_label_left.setGeometry(int(-24 * self.scale), int(13 * self.scale), int(150 * self.scale), int(72 * self.scale))
-        self.score_label_right.setGeometry(scaled_width - int(114 * self.scale), int(13 * self.scale), int(126 * self.scale), int(72 * self.scale))
+        self.score_label_left.setGeometry(
+            int(self.card_metrics["text_left_x"] * effective_scale),
+            int(self.card_metrics["text_y"] * effective_scale),
+            int(self.card_metrics["text_left_width"] * effective_scale),
+            int(self.card_metrics["text_height"] * effective_scale),
+        )
+        self.score_label_right.setGeometry(
+            scaled_width - int(self.card_metrics["text_right_x_offset"] * effective_scale),
+            int(self.card_metrics["text_y"] * effective_scale),
+            int(self.card_metrics["text_right_width"] * effective_scale),
+            int(self.card_metrics["text_height"] * effective_scale),
+        )
         self.update()
 
     def _format_duration(self, minutes: int) -> str:
@@ -712,6 +1865,13 @@ class AttendanceWidget(QWidget):
         if len(value) < 4:
             return "--:--"
         return f"{value[:2]}:{value[2:4]}"
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        self._resize_settings_window()
+        if self.details_panel.isVisible():
+            self._position_settings_window()
+        self._position_chat_window()
 
     def mousePressEvent(self, event) -> None:
         if event.button() == Qt.LeftButton:
@@ -751,20 +1911,15 @@ class AttendanceWidget(QWidget):
         super().mouseDoubleClickEvent(event)
 
     def paintEvent(self, event) -> None:
-        if not self.details_panel.isVisible():
-            return
+        super().paintEvent(event)
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
         painter.setPen(QPen(QColor(0, 0, 0, 100), 3))
-        target = self.details_panel.geometry()
-        painter.drawLine(target.x() + target.width() - 10, target.y() + target.height() - 1, target.x() + target.width() - 1, target.y() + target.height() - 1)
-        painter.drawLine(target.x() + target.width() - 1, target.y() + target.height() - 10, target.x() + target.width() - 1, target.y() + target.height() - 1)
+        painter.drawLine(self.width() - 10, self.height() - 1, self.width() - 1, self.height() - 1)
+        painter.drawLine(self.width() - 1, self.height() - 10, self.width() - 1, self.height() - 1)
 
     def _is_on_handle(self, pos: QPoint) -> bool:
-        if not self.details_panel.isVisible():
-            return False
-        target_rect = self.details_panel.geometry()
-        return pos.x() >= target_rect.right() - 14 and pos.y() >= target_rect.bottom() - 14
+        return pos.x() >= self.width() - 14 and pos.y() >= self.height() - 14
 
 
 

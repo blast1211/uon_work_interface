@@ -1,6 +1,6 @@
 ﻿from __future__ import annotations
 
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 
 from attendance_widget.models import DailyAttendance, WeeklySummary
 
@@ -65,15 +65,20 @@ def build_weekly_summary(
     total_worked_minutes = 0
     total_expected_minutes = 0
     today_minutes = 0
+    now_hhmm = datetime.now().strftime("%H%M")
 
     for day_key in sorted(valid_dates):
         row = rows_by_date.get(day_key)
         if row is None:
             continue
 
-        come_time, leave_time = normalize_times(row, default_start, default_end)
-        worked = worked_minutes(come_time, leave_time)
         expected = target_minutes_for_label(row.label, weekday_target, halfday_target)
+
+        if day_key == today_date and row.come_time and not row.leave_time:
+            worked = max(0, worked_minutes(row.come_time, now_hhmm))
+        else:
+            come_time, leave_time = normalize_times(row, default_start, default_end)
+            worked = worked_minutes(come_time, leave_time)
 
         total_worked_minutes += worked
         total_expected_minutes += expected
