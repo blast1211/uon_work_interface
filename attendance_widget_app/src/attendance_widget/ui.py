@@ -2,8 +2,10 @@
 
 from datetime import date, datetime
 from pathlib import Path
+import random
+import sys
 
-from PySide6.QtCore import QObject, QPoint, QSettings, QThread, QTimer, Qt, Signal, Slot
+from PySide6.QtCore import QObject, QPoint, QSettings, QThread, QTimer, Qt, Signal, Slot, QEvent, QPropertyAnimation, QEasingCurve
 from PySide6.QtGui import QColor, QFont, QFontDatabase, QKeySequence, QPainter, QPen, QPixmap, QRegion, QShortcut
 from PySide6.QtWidgets import (
     QApplication,
@@ -24,6 +26,7 @@ from PySide6.QtWidgets import (
     QStackedWidget,
     QVBoxLayout,
     QWidget,
+    QGraphicsOpacityEffect,
 )
 
 from attendance_widget.automation import AttendanceAutomation, AttendanceError, AttendanceSnapshot
@@ -32,15 +35,44 @@ from attendance_widget.chat import ChatConfig, LanChatClient
 from attendance_widget.config import load_settings
 
 
-ASSET_ROOT = Path(__file__).resolve().parents[3]
+def _discover_asset_root() -> Path:
+    source_root = Path(__file__).resolve().parents[3]
+    candidates: list[Path] = []
+
+    meipass = getattr(sys, "_MEIPASS", "")
+    if meipass:
+        meipass_path = Path(meipass)
+        candidates.extend([meipass_path / "assets", meipass_path])
+
+    if getattr(sys, "frozen", False):
+        exe_dir = Path(sys.executable).resolve().parent
+        candidates.extend([exe_dir / "assets", exe_dir])
+
+    candidates.extend([source_root / "assets", source_root])
+
+    seen: set[Path] = set()
+    for candidate in candidates:
+        resolved = candidate.resolve()
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        if (resolved / "koverwatch.ttf").exists():
+            return resolved
+    return source_root
+
+
+ASSET_ROOT = _discover_asset_root()
 FONT_PATH = ASSET_ROOT / "koverwatch.ttf"
 BLUE_PATH = ASSET_ROOT / "occupation_blue.png"
 RED_PATH  = ASSET_ROOT / "occupation_red.png"
 HOG_THUMB_PATH = ASSET_ROOT / "hog_thumb.png"
+THUMBNAIL_DIR = ASSET_ROOT / "thumbnail"
 HP_ICON_PATH = ASSET_ROOT / "HP.png"
 Q_SKILL_PATH = ASSET_ROOT / "Q_skill.png"
 HOG_SKILL_PATH = ASSET_ROOT / "hog_skill.png"
 HOG_GUN_PATH = ASSET_ROOT / "hog_gun.png"
+BACK_ICON_PATH = ASSET_ROOT / "back.png"
+TAB_BG_IMG_PATH = ASSET_ROOT / "tab_bg_img.png"
 DAY_NAMES = ["월", "화", "수", "목", "금"]
 REFRESH_INTERVAL_MS = 10_000
 SETTINGS_ORG = "Chansol"
@@ -319,6 +351,9 @@ class ChatInputBox(QPlainTextEdit):
     dismissed = Signal()
 
     def keyPressEvent(self, event) -> None:
+        if event.key() == Qt.Key_Tab:
+            event.accept()
+            return
         if event.key() in (Qt.Key_Return, Qt.Key_Enter):
             if event.modifiers() & Qt.ShiftModifier:
                 super().keyPressEvent(event)
@@ -440,7 +475,20 @@ class AttendanceWidget(QWidget):
         self.qt_settings = QSettings(SETTINGS_ORG, SETTINGS_APP)
         self.chat_client: LanChatClient | None = None
         self.chat_connected = False
-        self.chat_font_family = "Dotum"
+        self.chat_presence_announced = False
+        self.chat_drag_origin: QPoint | None = None
+        self.chat_panel_pos_override: QPoint | None = None
+        self.chat_resize_origin: QPoint | None = None
+        self.chat_resize_start_geometry = None
+        self.chat_resize_edges: str = ""
+        self.chat_preview_mode = False
+        self.chat_preview_timers: dict[int, tuple[QListWidgetItem, QTimer]] = {}
+        self.chat_users: dict[str, dict[str, str]] = {}
+        self.selected_thumbnail_name = ""
+        self.thumbnail_pixmaps: dict[str, QPixmap] = {}
+        self.chat_roster_visible = False
+        self.chat_roster_target_visible = False
+        self.chat_font_family = "Malgun Gothic"
         self.chat_metrics = {
             "panel_width": 430,
             "panel_height": 300,
@@ -452,10 +500,40 @@ class AttendanceWidget(QWidget):
             "input_font_size": 16,
             "input_height": 82,
             "list_spacing": 4,
+            "panel_gap": 12,
+            "history_radius": 18,
+            "input_radius": 14,
+            "history_padding_left": 14,
+            "history_padding_top": 12,
+            "history_padding_right": 10,
+            "history_padding_bottom": 12,
+            "input_padding_left": 12,
+            "input_padding_top": 8,
+            "input_padding_right": 12,
+            "input_padding_bottom": 8,
+            "input_text_padding_x": 8,
+            "input_text_padding_y": 6,
+            "scrollbar_width": 14,
+            "scrollbar_margin_top": 10,
+            "scrollbar_margin_right": 4,
+            "scrollbar_margin_bottom": 10,
+            "scrollbar_radius": 8,
+            "scrollbar_handle_min_height": 44,
             "notice_width": 420,
             "notice_height": 74,
             "notice_left": 34,
             "notice_gap": 14,
+            "roster_slot_size": 92,
+            "roster_back_scale": 2.2,
+            "roster_back_offset_y": -120,
+            "roster_avatar_scale": 2.2,
+            "roster_avatar_offset_x": 0,
+            "roster_avatar_offset_y": 15,
+            "roster_fade_in_ms": 180,
+            "roster_fade_out_ms": 140,
+            "roster_name_font_size": 35,
+            "roster_name_italic": 1,
+            "roster_name_bold": 0,
         }
         self.card_metrics = {
             "image_scale": 0.5,
@@ -469,7 +547,7 @@ class AttendanceWidget(QWidget):
         self.hud_metrics = {
             "left_thumb_padding_x": 36,
             "left_thumb_padding_y": 34,
-            "left_thumb_scale": 0.2,
+            "left_thumb_scale": 0.1,
             "left_hp_padding_x": 0,
             "left_hp_padding_y": 90,
             "left_hp_gap": 14,
@@ -514,6 +592,9 @@ class AttendanceWidget(QWidget):
         self._load_assets()
         self._build_worker()
         self._build_ui()
+        app = QApplication.instance()
+        if app is not None:
+            app.installEventFilter(self)
         self._build_timer()
         self._load_saved_preferences()
         self._update_score_card(0)
@@ -533,6 +614,9 @@ class AttendanceWidget(QWidget):
 
     def _scaled_hud_metric(self, name: str) -> int:
         return int(round(self.hud_metrics[name] * self.resolution_scale))
+
+    def _scaled_chat_metric(self, name: str, minimum: int = 0) -> int:
+        return max(minimum, int(round(self.chat_metrics[name] * self.resolution_scale)))
 
     def _display_font(self, size: int, italic: bool = False) -> QFont:
         font = QFont(self.font_family, size)
@@ -565,11 +649,22 @@ class AttendanceWidget(QWidget):
         self.card_pixmap = self.blue_bg if not self.blue_bg.isNull() else QPixmap()
         self.blue_bg_dim = self._make_dimmed_pixmap(self.blue_bg)
         self.red_bg_dim = self._make_dimmed_pixmap(self.red_bg)
-        self.hog_thumb_pixmap = QPixmap(str(HOG_THUMB_PATH))
+        thumbnail_candidates: list[Path] = []
+        if THUMBNAIL_DIR.exists() and THUMBNAIL_DIR.is_dir():
+            for pattern in ("*.png", "*.jpg", "*.jpeg", "*.webp"):
+                thumbnail_candidates.extend(sorted(THUMBNAIL_DIR.glob(pattern)))
+        if not thumbnail_candidates and HOG_THUMB_PATH.exists():
+            thumbnail_candidates.append(HOG_THUMB_PATH)
+        self.thumbnail_pixmaps = {path.name: QPixmap(str(path)) for path in thumbnail_candidates}
+        selected_thumbnail = random.choice(thumbnail_candidates) if thumbnail_candidates else HOG_THUMB_PATH
+        self.selected_thumbnail_name = selected_thumbnail.name
+        self.hog_thumb_pixmap = QPixmap(str(selected_thumbnail))
         self.hp_icon_pixmap = QPixmap(str(HP_ICON_PATH))
         self.q_skill_pixmap = QPixmap(str(Q_SKILL_PATH))
         self.hog_skill_pixmap = QPixmap(str(HOG_SKILL_PATH))
         self.hog_gun_pixmap = QPixmap(str(HOG_GUN_PATH))
+        self.roster_back_pixmap = QPixmap(str(BACK_ICON_PATH))
+        self.tab_bg_pixmap = QPixmap(str(TAB_BG_IMG_PATH))
 
     def _make_dimmed_pixmap(self, pixmap: QPixmap) -> QPixmap:
         if pixmap.isNull():
@@ -615,6 +710,7 @@ class AttendanceWidget(QWidget):
         root.addWidget(self.card, alignment=Qt.AlignLeft | Qt.AlignTop)
         self._build_settings_window()
         self._build_chat_window()
+        self._build_chat_roster_window()
         self._apply_card_geometry()
         self.adjustSize()
 
@@ -704,6 +800,7 @@ class AttendanceWidget(QWidget):
         if self.settings_metrics["input_width"] > 0:
             self.username_input.setFixedWidth(self._scaled_metric("input_width"))
         self.username_input.setStyleSheet(self._field_style("username_field_font_size"))
+        self.username_input.textChanged.connect(self._sync_chat_identity_field)
         self._add_setting_row(session_card_layout, "아이디", self.username_input)
 
         self.password_input = QLineEdit()
@@ -734,7 +831,42 @@ class AttendanceWidget(QWidget):
             if self.settings_metrics["action_button_min_width"] > 0:
                 button.setMinimumWidth(self._scaled_metric("action_button_min_width"))
             button.setStyleSheet(self._action_button_style())
-            action_row.addWidget(button)
+
+        self.work_in_time_label = QLabel("")
+        self.work_in_time_label.setAlignment(Qt.AlignCenter)
+        self.work_in_time_label.setStyleSheet(
+            f"color: #48d9ff; background: transparent; font-family: '{self.font_family}'; font-size: {self.settings_metrics['hint_font_size']}px;"
+        )
+        self.work_out_time_label = QLabel("")
+        self.work_out_time_label.setAlignment(Qt.AlignCenter)
+        self.work_out_time_label.setStyleSheet(
+            f"color: #ff6a6a; background: transparent; font-family: '{self.font_family}'; font-size: {self.settings_metrics['hint_font_size']}px;"
+        )
+
+        refresh_col = QVBoxLayout()
+        refresh_col.setSpacing(6)
+        refresh_col.addWidget(self.refresh_button)
+        refresh_col.addWidget(QLabel(""))
+        action_row.addLayout(refresh_col)
+
+        work_in_col = QVBoxLayout()
+        work_in_col.setSpacing(6)
+        work_in_col.addWidget(self.work_in_button)
+        work_in_col.addWidget(self.work_in_time_label)
+        action_row.addLayout(work_in_col)
+
+        work_out_col = QVBoxLayout()
+        work_out_col.setSpacing(6)
+        work_out_col.addWidget(self.work_out_button)
+        work_out_col.addWidget(self.work_out_time_label)
+        action_row.addLayout(work_out_col)
+
+        exit_col = QVBoxLayout()
+        exit_col.setSpacing(6)
+        exit_col.addWidget(self.exit_button)
+        exit_col.addWidget(QLabel(""))
+        action_row.addLayout(exit_col)
+
         self.refresh_button.clicked.connect(self.refresh_snapshot)
         self.work_in_button.clicked.connect(self.work_in)
         self.work_out_button.clicked.connect(self.work_out)
@@ -853,12 +985,13 @@ class AttendanceWidget(QWidget):
         self._add_setting_row(chat_card_layout, "시스템 메시지", self.chat_system_checkbox, label_width=self.settings_metrics["chat_row_label_width"])
 
         self.chat_nickname_input = QLineEdit()
-        self.chat_nickname_input.setPlaceholderText("비우면 로그인 아이디 사용")
+        self.chat_nickname_input.setPlaceholderText("로그인 아이디와 동일")
+        self.chat_nickname_input.setReadOnly(True)
+        self.chat_nickname_input.setFocusPolicy(Qt.NoFocus)
         self.chat_nickname_input.setMinimumHeight(self._scaled_metric("input_height"))
         self.chat_nickname_input.setFixedWidth(self._scaled_metric("input_width"))
         self.chat_nickname_input.setStyleSheet(self._field_style())
-        self.chat_nickname_input.editingFinished.connect(self._on_chat_settings_edited)
-        self._add_setting_row(chat_card_layout, "닉네임", self.chat_nickname_input, label_width=self.settings_metrics["chat_row_label_width"])
+        self._add_setting_row(chat_card_layout, "채팅 ID", self.chat_nickname_input, label_width=self.settings_metrics["chat_row_label_width"])
 
         self.chat_room_input = QLineEdit()
         self.chat_room_input.setPlaceholderText("attendance-room")
@@ -897,6 +1030,19 @@ class AttendanceWidget(QWidget):
         chat_opacity_row.addWidget(self.chat_opacity_value_label)
         self._add_setting_row(chat_card_layout, "채팅창 투명도", chat_opacity_row, label_width=self.settings_metrics["chat_row_label_width"])
 
+        chat_font_row = QHBoxLayout()
+        chat_font_row.setSpacing(12)
+        self.chat_font_size_slider = QSlider(Qt.Horizontal)
+        self.chat_font_size_slider.setRange(10, 32)
+        self.chat_font_size_slider.valueChanged.connect(self._on_chat_font_size_changed)
+        self.chat_font_size_slider.setStyleSheet(self._slider_style())
+        self.chat_font_size_slider.setMinimumHeight(26)
+        self.chat_font_size_value_label = QLabel("16px")
+        self.chat_font_size_value_label.setStyleSheet(self._settings_value_style())
+        chat_font_row.addWidget(self.chat_font_size_slider, 1)
+        chat_font_row.addWidget(self.chat_font_size_value_label)
+        self._add_setting_row(chat_card_layout, "채팅 폰트 크기", chat_font_row, label_width=self.settings_metrics["chat_row_label_width"])
+
         chat_hide_row = QHBoxLayout()
         chat_hide_row.setSpacing(12)
         self.chat_hide_slider = QSlider(Qt.Horizontal)
@@ -934,29 +1080,79 @@ class AttendanceWidget(QWidget):
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
 
+        shell_radius = max(12, int(round(self.chat_metrics["history_radius"] * self.resolution_scale)))
+        panel_radius = max(10, int(round(self.chat_metrics["input_radius"] * self.resolution_scale)))
+        shell_layout_gap = max(6, int(round(self.chat_metrics["panel_gap"] * self.resolution_scale)))
+        shared_panel_background = "rgba(14, 21, 34, 222)"
+        shared_panel_border = "rgba(118, 169, 214, 0.20)"
+        scroll_handle_radius = max(4, int(round(self.chat_metrics["scrollbar_radius"] * self.resolution_scale)))
+        chat_scrollbar_style = (
+            "QScrollBar:vertical {"
+            " background: transparent;"
+            f" width: {max(8, int(round(self.chat_metrics['scrollbar_width'] * self.resolution_scale)))}px;"
+            f" margin: {max(0, int(round(self.chat_metrics['scrollbar_margin_top'] * self.resolution_scale)))}px {max(0, int(round(self.chat_metrics['scrollbar_margin_right'] * self.resolution_scale)))}px {max(0, int(round(self.chat_metrics['scrollbar_margin_bottom'] * self.resolution_scale)))}px 0px;"
+            " border: none;"
+            "}"
+            "QScrollBar::handle:vertical {"
+            " background: rgba(245, 248, 255, 0.78);"
+            f" border-radius: {scroll_handle_radius}px;"
+            f" min-height: {max(24, int(round(self.chat_metrics['scrollbar_handle_min_height'] * self.resolution_scale)))}px;"
+            "}"
+            "QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {"
+            " height: 0px;"
+            " background: transparent;"
+            " border: none;"
+            "}"
+            "QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {"
+            " background: transparent;"
+            "}"
+        )
+
         self.chat_shell = QFrame(self.chat_panel)
-        self.chat_shell.setStyleSheet("QFrame { background: rgba(7, 12, 18, 230); border: 1px solid rgba(54,224,255,0.22); }")
+        self.chat_shell.mousePressEvent = self._chat_mouse_press_event
+        self.chat_shell.mouseMoveEvent = self._chat_mouse_move_event
+        self.chat_shell.mouseReleaseEvent = self._chat_mouse_release_event
+        self.chat_shell.setStyleSheet(
+            "QFrame {"
+            " background: transparent;"
+            " border: none;"
+            "}"
+        )
         shell_layout = QVBoxLayout(self.chat_shell)
-        shell_layout.setContentsMargins(14, 12, 14, 12)
-        shell_layout.setSpacing(8)
+        shell_layout.setContentsMargins(0, 0, 0, 0)
+        shell_layout.setSpacing(shell_layout_gap)
 
-        title_row = QHBoxLayout()
-        title_row.setContentsMargins(0, 0, 0, 0)
-        self.chat_title_label = QLabel("LAN CHAT", self.chat_shell)
-        self.chat_title_label.setStyleSheet(
-            f"color: #7aeaff; font-family: '{self.chat_font_family}'; font-size: {max(14, int(round(self.chat_metrics['title_font_size'] * self.resolution_scale)))}px; background: transparent;"
+        self.chat_history_frame_style = (
+            "QFrame {"
+            f" background: {shared_panel_background};"
+            f" border: 1px solid {shared_panel_border};"
+            f" border-radius: {shell_radius}px;"
+            "}"
         )
-        self.chat_state_label = QLabel("대기 중", self.chat_shell)
-        self.chat_state_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-        self.chat_state_label.setStyleSheet(
-            f"color: rgba(232,240,255,0.68); font-family: '{self.chat_font_family}'; font-size: {max(11, int(round(self.chat_metrics['meta_font_size'] * self.resolution_scale)))}px; background: transparent;"
+        self.chat_history_preview_style = (
+            "QFrame {"
+            " background: transparent;"
+            " border: none;"
+            "}"
         )
-        title_row.addWidget(self.chat_title_label)
-        title_row.addStretch(1)
-        title_row.addWidget(self.chat_state_label)
-        shell_layout.addLayout(title_row)
+        self.chat_history_frame = QFrame(self.chat_shell)
+        self.chat_history_frame.mousePressEvent = self._chat_mouse_press_event
+        self.chat_history_frame.mouseMoveEvent = self._chat_mouse_move_event
+        self.chat_history_frame.mouseReleaseEvent = self._chat_mouse_release_event
+        self.chat_history_frame.setStyleSheet(self.chat_history_frame_style)
+        history_layout = QVBoxLayout(self.chat_history_frame)
+        history_layout.setContentsMargins(
+            self._scaled_chat_metric("history_padding_left"),
+            self._scaled_chat_metric("history_padding_top"),
+            self._scaled_chat_metric("history_padding_right"),
+            self._scaled_chat_metric("history_padding_bottom"),
+        )
+        history_layout.setSpacing(8)
 
-        self.chat_history = QListWidget(self.chat_shell)
+        self.chat_history = QListWidget(self.chat_history_frame)
+        self.chat_history.mousePressEvent = self._chat_mouse_press_event
+        self.chat_history.mouseMoveEvent = self._chat_mouse_move_event
+        self.chat_history.mouseReleaseEvent = self._chat_mouse_release_event
         self.chat_history.setFocusPolicy(Qt.NoFocus)
         self.chat_history.setSelectionMode(QListWidget.NoSelection)
         self.chat_history.setWordWrap(True)
@@ -964,22 +1160,44 @@ class AttendanceWidget(QWidget):
         self.chat_history.setTextElideMode(Qt.ElideNone)
         self.chat_history.setWrapping(False)
         self.chat_history.setStyleSheet(
-            f"QListWidget {{ background: rgba(0,0,0,0.16); color: rgba(242,247,255,0.95); border: none; outline: none; font-family: '{self.chat_font_family}'; font-size: {max(12, int(round(self.chat_metrics['message_font_size'] * self.resolution_scale)))}px; }}"
+            f"QListWidget {{ background: transparent; color: rgba(242,247,255,0.95); border: none; outline: none; font-family: '{self.chat_font_family}'; font-size: {max(12, int(round(self.chat_metrics['message_font_size'] * self.resolution_scale)))}px; padding-right: 4px; }}"
             "QListWidget::item { padding: 4px 2px; border: none; }"
+            + chat_scrollbar_style
         )
-        shell_layout.addWidget(self.chat_history, 1)
+        history_layout.addWidget(self.chat_history, 1)
+        shell_layout.addWidget(self.chat_history_frame, 1)
 
-        self.chat_input = ChatInputBox(self.chat_shell)
+        self.chat_input_frame = QFrame(self.chat_shell)
+        self.chat_input_frame.setStyleSheet(
+            "QFrame {"
+            f" background: {shared_panel_background};"
+            f" border: 1px solid {shared_panel_border};"
+            f" border-radius: {panel_radius}px;"
+            "}"
+        )
+        input_layout = QVBoxLayout(self.chat_input_frame)
+        input_layout.setContentsMargins(
+            self._scaled_chat_metric("input_padding_left"),
+            self._scaled_chat_metric("input_padding_top"),
+            self._scaled_chat_metric("input_padding_right"),
+            self._scaled_chat_metric("input_padding_bottom"),
+        )
+        input_layout.setSpacing(6)
+
+        self.chat_input = ChatInputBox(self.chat_input_frame)
         self.chat_input.setPlaceholderText("메시지를 입력하세요. Enter 전송 / Shift+Enter 줄바꿈 / Esc 닫기")
         self.chat_input.setLineWrapMode(QPlainTextEdit.WidgetWidth)
         self.chat_input.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.chat_input.setFixedHeight(max(52, int(round(self.chat_metrics['input_height'] * self.resolution_scale))))
         self.chat_input.setStyleSheet(
-            f"QPlainTextEdit {{ background: rgba(241,246,255,0.96); color: #1a2533; border: none; padding: 8px 10px; font-family: '{self.chat_font_family}'; font-size: {max(12, int(round(self.chat_metrics['input_font_size'] * self.resolution_scale)))}px; }}"
+            f"QPlainTextEdit {{ background: transparent; color: #f3f8ff; border: none; padding: {self._scaled_chat_metric('input_text_padding_y')}px {self._scaled_chat_metric('input_text_padding_x')}px; font-family: '{self.chat_font_family}'; font-size: {max(12, int(round(self.chat_metrics['input_font_size'] * self.resolution_scale)))}px; }}"
+            f"QPlainTextEdit[placeholderText] {{ color: rgba(211,224,240,0.46); }}"
+            + chat_scrollbar_style
         )
         self.chat_input.send_requested.connect(self._send_chat_message)
         self.chat_input.dismissed.connect(self._hide_chat_panel)
-        shell_layout.addWidget(self.chat_input)
+        input_layout.addWidget(self.chat_input)
+        shell_layout.addWidget(self.chat_input_frame)
 
         self.chat_hint_label = QLabel("Shift+Enter 로 열기", self.chat_shell)
         self.chat_hint_label.setStyleSheet(
@@ -987,40 +1205,36 @@ class AttendanceWidget(QWidget):
         )
         shell_layout.addWidget(self.chat_hint_label)
 
+        self.chat_preview_spacer = QWidget(self.chat_shell)
+        self.chat_preview_spacer.setFixedHeight(self.chat_input_frame.sizeHint().height() + self.chat_hint_label.sizeHint().height() + shell_layout.spacing())
+        self.chat_preview_spacer.hide()
+        shell_layout.addWidget(self.chat_preview_spacer)
+
+        self.chat_preview_frame = QFrame(self.chat_shell)
+        self.chat_preview_frame.mousePressEvent = self._chat_mouse_press_event
+        self.chat_preview_frame.mouseMoveEvent = self._chat_mouse_move_event
+        self.chat_preview_frame.mouseReleaseEvent = self._chat_mouse_release_event
+        self.chat_preview_frame.setStyleSheet("QFrame { background: transparent; border: none; }")
+        self.chat_preview_items: list[QFrame] = []
+        self.chat_preview_layout = QVBoxLayout(self.chat_preview_frame)
+        self.chat_preview_layout.setContentsMargins(0, 0, 0, 0)
+        self.chat_preview_layout.setSpacing(4)
+        self.chat_preview_layout.addStretch(1)
+        self.chat_preview_stack = QVBoxLayout()
+        self.chat_preview_stack.setContentsMargins(0, 0, 0, 0)
+        self.chat_preview_stack.setSpacing(4)
+        self.chat_preview_layout.addLayout(self.chat_preview_stack)
+        self.chat_preview_frame.hide()
+        shell_layout.addWidget(self.chat_preview_frame, 1)
+
         root.addWidget(self.chat_shell)
         self.chat_panel.hide()
 
-        self.chat_notice_panel = QWidget(None)
-        self.chat_notice_panel.setWindowTitle("채팅 알림")
-        self.chat_notice_panel.setWindowFlags(Qt.FramelessWindowHint | Qt.Tool | Qt.WindowStaysOnTopHint)
-        self.chat_notice_panel.setAttribute(Qt.WA_TranslucentBackground)
-        notice_root = QVBoxLayout(self.chat_notice_panel)
-        notice_root.setContentsMargins(0, 0, 0, 0)
-        self.chat_notice_shell = QFrame(self.chat_notice_panel)
-        self.chat_notice_shell.setStyleSheet("QFrame { background: rgba(7, 12, 18, 210); border: 1px solid rgba(255,255,255,0.08); }")
-        notice_layout = QVBoxLayout(self.chat_notice_shell)
-        notice_layout.setContentsMargins(12, 10, 12, 10)
-        notice_layout.setSpacing(4)
-        self.chat_notice_sender = QLabel("", self.chat_notice_shell)
-        self.chat_notice_sender.setStyleSheet(
-            f"color: #7aeaff; font-family: '{self.chat_font_family}'; font-size: {max(12, int(round(self.chat_metrics['message_font_size'] * self.resolution_scale)))}px; background: transparent;"
-        )
-        self.chat_notice_text = QLabel("", self.chat_notice_shell)
-        self.chat_notice_text.setWordWrap(True)
-        self.chat_notice_text.setStyleSheet(
-            f"color: #7aeaff; font-family: '{self.chat_font_family}'; font-size: {max(12, int(round(self.chat_metrics['message_font_size'] * self.resolution_scale)))}px; background: transparent;"
-        )
-        notice_layout.addWidget(self.chat_notice_sender)
-        notice_layout.addWidget(self.chat_notice_text)
-        notice_root.addWidget(self.chat_notice_shell)
-        self.chat_notice_panel.hide()
+        self.chat_notice_panel = None
 
         self.chat_hide_timer = QTimer(self)
         self.chat_hide_timer.setSingleShot(True)
         self.chat_hide_timer.timeout.connect(self._hide_chat_panel_if_idle)
-        self.chat_notice_timer = QTimer(self)
-        self.chat_notice_timer.setSingleShot(True)
-        self.chat_notice_timer.timeout.connect(self.chat_notice_panel.hide)
 
         self.chat_shortcut = QShortcut(QKeySequence("Shift+Return"), self)
         self.chat_shortcut.activated.connect(self._activate_chat_input)
@@ -1030,43 +1244,333 @@ class AttendanceWidget(QWidget):
         self._position_chat_window()
         self._position_chat_notice_window()
 
+    def _chat_roster_name_style(self) -> str:
+        font_size = self._scaled_chat_metric("roster_name_font_size", 10)
+        font_style = "italic" if self.chat_metrics.get("roster_name_italic", 0) else "normal"
+        font_weight = "700" if self.chat_metrics.get("roster_name_bold", 0) else "400"
+        return (
+            f"color: #39e6ff; background: transparent; font-family: '{self.font_family}'; "
+            f"font-size: {font_size}px; font-style: {font_style}; font-weight: {font_weight};"
+        )
+
+    def _build_chat_roster_window(self) -> None:
+        self.chat_roster_panel = QWidget(None)
+        self.chat_roster_panel.setWindowTitle("채팅 접속자")
+        self.chat_roster_panel.setWindowFlags(Qt.FramelessWindowHint | Qt.Tool | Qt.WindowStaysOnTopHint)
+        self.chat_roster_panel.setAttribute(Qt.WA_TranslucentBackground)
+        self.chat_roster_opacity = QGraphicsOpacityEffect(self.chat_roster_panel)
+        self.chat_roster_opacity.setOpacity(0.0)
+        self.chat_roster_panel.setGraphicsEffect(self.chat_roster_opacity)
+        self.chat_roster_fade_animation = QPropertyAnimation(self.chat_roster_opacity, b"opacity", self)
+        self.chat_roster_fade_animation.setEasingCurve(QEasingCurve.InOutQuad)
+        self.chat_roster_fade_animation.finished.connect(self._on_chat_roster_fade_finished)
+
+        outer = QVBoxLayout(self.chat_roster_panel)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        self.chat_roster_background = QLabel(self.chat_roster_panel)
+        self.chat_roster_background.setScaledContents(True)
+        self.chat_roster_background.lower()
+
+        self.chat_roster_content = QWidget(self.chat_roster_panel)
+        content_layout = QVBoxLayout(self.chat_roster_content)
+        content_layout.setContentsMargins(48, 38, 48, 56)
+        content_layout.setSpacing(0)
+        content_layout.addStretch(1)
+
+        self.chat_roster_rows_host = QWidget(self.chat_roster_content)
+        self.chat_roster_rows_host.setStyleSheet("QWidget { background: transparent; border: none; }")
+        self.chat_roster_rows_layout = QVBoxLayout(self.chat_roster_rows_host)
+        self.chat_roster_rows_layout.setContentsMargins(0, 0, 0, 0)
+        self.chat_roster_rows_layout.setSpacing(32)
+        content_layout.addWidget(self.chat_roster_rows_host, 0, Qt.AlignCenter)
+        content_layout.addStretch(1)
+
+        self.chat_roster_row_widgets: list[QWidget] = []
+
+        outer.addWidget(self.chat_roster_content)
+        self.chat_roster_panel.hide()
+        self._position_chat_roster_window()
+        self._update_chat_roster_window()
+
+    def _position_chat_roster_window(self) -> None:
+        if not hasattr(self, "chat_roster_panel"):
+            return
+        screen = QApplication.primaryScreen()
+        if screen is None:
+            self.chat_roster_panel.setGeometry(0, 0, 1280, 720)
+            self.chat_roster_background.setGeometry(self.chat_roster_panel.rect())
+            return
+        available = screen.availableGeometry()
+        self.chat_roster_panel.setGeometry(available)
+        self.chat_roster_background.setGeometry(self.chat_roster_panel.rect())
+        if hasattr(self, "tab_bg_pixmap") and not self.tab_bg_pixmap.isNull():
+            self.chat_roster_background.setPixmap(
+                self.tab_bg_pixmap.scaled(self.chat_roster_panel.size(), Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
+            )
+        else:
+            self.chat_roster_background.clear()
+        self.chat_roster_content.setGeometry(self.chat_roster_panel.rect())
+
+    def _resolve_chat_avatar_pixmap(self, avatar_name: str) -> QPixmap:
+        avatar = self.thumbnail_pixmaps.get(avatar_name, QPixmap()) if hasattr(self, "thumbnail_pixmaps") else QPixmap()
+        if avatar.isNull():
+            avatar = self.hog_thumb_pixmap if hasattr(self, "hog_thumb_pixmap") else QPixmap()
+        slot_size = self._scaled_chat_metric("roster_slot_size", 48)
+        if not hasattr(self, "roster_back_pixmap") or self.roster_back_pixmap.isNull():
+            return avatar.scaledToHeight(slot_size, Qt.SmoothTransformation) if not avatar.isNull() else QPixmap()
+
+        back_scale = max(0.1, self.chat_metrics["roster_back_scale"])
+        avatar_scale = max(0.1, self.chat_metrics["roster_avatar_scale"])
+        base_size = max(1, int(round(slot_size * back_scale)))
+        avatar_size = max(1, int(round(slot_size * avatar_scale)))
+        base = self.roster_back_pixmap.scaled(base_size, base_size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        avatar_scaled = avatar.scaled(avatar_size, avatar_size, Qt.KeepAspectRatio, Qt.SmoothTransformation) if not avatar.isNull() else QPixmap()
+
+        offset_x = self._scaled_chat_metric("roster_avatar_offset_x")
+        avatar_bottom_inset = self._scaled_chat_metric("roster_avatar_offset_y")
+        back_offset_y = self._scaled_chat_metric("roster_back_offset_y")
+
+        left_pad = max(0, -offset_x)
+        right_pad = max(0, offset_x)
+        canvas_width = max(base.width(), avatar_scaled.width() + left_pad + right_pad, slot_size)
+
+        baseline = max(
+            slot_size,
+            avatar_scaled.height() + max(0, avatar_bottom_inset),
+            base.height() + max(0, -back_offset_y),
+        )
+        canvas_height = baseline + max(0, back_offset_y)
+
+        composed = QPixmap(canvas_width, canvas_height)
+        composed.fill(Qt.transparent)
+        painter = QPainter(composed)
+        painter.setRenderHint(QPainter.SmoothPixmapTransform)
+
+        base_x = int((canvas_width - base.width()) / 2)
+        base_y = baseline + back_offset_y - base.height()
+        painter.drawPixmap(base_x, base_y, base)
+
+        if not avatar_scaled.isNull():
+            x = int((canvas_width - avatar_scaled.width()) / 2) + offset_x
+            y = baseline - avatar_bottom_inset - avatar_scaled.height()
+            painter.drawPixmap(x, y, avatar_scaled)
+
+        painter.end()
+        return composed
+
+    def _update_chat_roster_window(self) -> None:
+        if not hasattr(self, "chat_roster_rows_layout"):
+            return
+        users = list(self.chat_users.values())
+        users.sort(key=lambda item: (0 if item.get("is_self") == "1" else 1, item.get("nickname", "")))
+
+        while self.chat_roster_row_widgets:
+            row_widget = self.chat_roster_row_widgets.pop()
+            self.chat_roster_rows_layout.removeWidget(row_widget)
+            row_widget.deleteLater()
+
+        if not users:
+            return
+
+        per_row = 8
+        slot_size = self._scaled_chat_metric("roster_slot_size", 48)
+        row_gap = max(8, int(round(32 * self.resolution_scale)))
+        slot_gap = max(10, int(round(26 * self.resolution_scale)))
+        name_style = self._chat_roster_name_style()
+
+        for start in range(0, len(users), per_row):
+            row_users = users[start:start + per_row]
+            row_widget = QWidget(self.chat_roster_rows_host)
+            row_widget.setStyleSheet("QWidget { background: transparent; border: none; }")
+            row_layout = QHBoxLayout(row_widget)
+            row_layout.setContentsMargins(0, 0, 0, 0)
+            row_layout.setSpacing(slot_gap)
+            row_layout.addStretch(1)
+
+            for user in row_users:
+                slot = QWidget(row_widget)
+                slot.setStyleSheet("QWidget { background: transparent; border: none; }")
+                slot_layout = QVBoxLayout(slot)
+                slot_layout.setContentsMargins(0, 0, 0, 0)
+                slot_layout.setSpacing(8)
+
+                avatar = QLabel(slot)
+                avatar.setAlignment(Qt.AlignCenter)
+                avatar.setMinimumSize(slot_size, slot_size)
+                pixmap = self._resolve_chat_avatar_pixmap(user.get("avatar_name", ""))
+                avatar.setPixmap(pixmap if not pixmap.isNull() else QPixmap())
+
+                name = QLabel(user.get("nickname", ""), slot)
+                name.setAlignment(Qt.AlignCenter)
+                name.setStyleSheet(name_style)
+
+                slot_layout.addWidget(avatar, 0, Qt.AlignCenter)
+                slot_layout.addWidget(name, 0, Qt.AlignCenter)
+                row_layout.addWidget(slot, 0, Qt.AlignCenter)
+
+            row_layout.addStretch(1)
+            self.chat_roster_rows_layout.addWidget(row_widget, 0, Qt.AlignCenter)
+            self.chat_roster_row_widgets.append(row_widget)
+
+        self.chat_roster_rows_layout.setSpacing(row_gap)
+
+    def _upsert_chat_user(self, client_id: str, nickname: str, avatar_name: str, is_self: bool = False) -> None:
+        if not client_id:
+            return
+        self.chat_users[client_id] = {
+            "nickname": nickname or "익명",
+            "avatar_name": avatar_name or self.selected_thumbnail_name,
+            "is_self": "1" if is_self else "0",
+        }
+        self._update_chat_roster_window()
+
+    def _remove_chat_user(self, client_id: str) -> None:
+        if client_id in self.chat_users:
+            self.chat_users.pop(client_id, None)
+            self._update_chat_roster_window()
+
+    def _animate_chat_roster(self, visible: bool) -> None:
+        if not hasattr(self, "chat_roster_panel"):
+            return
+        if not hasattr(self, "chat_roster_fade_animation") or not hasattr(self, "chat_roster_opacity"):
+            if visible:
+                self._position_chat_roster_window()
+                self._update_chat_roster_window()
+                self.chat_roster_panel.show()
+                self.chat_roster_panel.raise_()
+                self.chat_roster_visible = True
+            else:
+                self.chat_roster_panel.hide()
+                self.chat_roster_visible = False
+            return
+        self.chat_roster_target_visible = visible
+        self.chat_roster_fade_animation.stop()
+        start_value = self.chat_roster_opacity.opacity()
+        if visible:
+            self._position_chat_roster_window()
+            self._update_chat_roster_window()
+            self.chat_roster_panel.show()
+            self.chat_roster_panel.raise_()
+            self.chat_roster_visible = True
+            self.chat_roster_fade_animation.setDuration(max(0, int(self.chat_metrics["roster_fade_in_ms"])))
+            self.chat_roster_fade_animation.setStartValue(start_value)
+            self.chat_roster_fade_animation.setEndValue(1.0)
+            self.chat_roster_fade_animation.start()
+            self._raise_primary_overlays()
+        else:
+            if not self.chat_roster_panel.isVisible() and start_value <= 0.0:
+                self.chat_roster_visible = False
+                self.chat_roster_opacity.setOpacity(0.0)
+                return
+            self.chat_roster_fade_animation.setDuration(max(0, int(self.chat_metrics["roster_fade_out_ms"])))
+            self.chat_roster_fade_animation.setStartValue(start_value)
+            self.chat_roster_fade_animation.setEndValue(0.0)
+            self.chat_roster_fade_animation.start()
+
+    def _on_chat_roster_fade_finished(self) -> None:
+        if not getattr(self, "chat_roster_target_visible", False):
+            self.chat_roster_panel.hide()
+            self.chat_roster_visible = False
+            self.chat_roster_opacity.setOpacity(0.0)
+        else:
+            self.chat_roster_visible = True
+            self.chat_roster_opacity.setOpacity(1.0)
+
+    def _raise_primary_overlays(self) -> None:
+        self.raise_()
+        if hasattr(self, "chat_panel") and self.chat_panel.isVisible():
+            self.chat_panel.raise_()
+
+    def _show_chat_roster(self) -> None:
+        if not self.is_logged_in or not self.chat_connected or not self.chat_users:
+            return
+        self._animate_chat_roster(True)
+        self._raise_primary_overlays()
+
+    def _hide_chat_roster(self) -> None:
+        self._animate_chat_roster(False)
+
     def _position_chat_window(self) -> None:
         if not hasattr(self, "chat_panel"):
             return
         screen = QApplication.primaryScreen()
-        if screen is None:
-            width = int(round(self.chat_metrics["panel_width"] * self.resolution_scale))
-            height = int(round(self.chat_metrics["panel_height"] * self.resolution_scale))
-            self.chat_panel.setFixedSize(width, height)
-            self.chat_panel.move(int(round(self.chat_metrics["panel_left"] * self.resolution_scale)), 320)
-            return
-        available = screen.availableGeometry()
         width = int(round(self.chat_metrics["panel_width"] * self.resolution_scale))
         height = int(round(self.chat_metrics["panel_height"] * self.resolution_scale))
-        anchor_offset = int(round(self.chat_metrics["panel_anchor_y"] * self.resolution_scale))
-        left = available.left() + int(round(self.chat_metrics["panel_left"] * self.resolution_scale))
-        top = available.top() + int((available.height() - height) / 2) + anchor_offset
-        self.chat_panel.setGeometry(left, top, width, height)
-
-    def _position_chat_notice_window(self) -> None:
-        if not hasattr(self, "chat_notice_panel"):
-            return
-        screen = QApplication.primaryScreen()
-        width = int(round(self.chat_metrics["notice_width"] * self.resolution_scale))
-        height = int(round(self.chat_metrics["notice_height"] * self.resolution_scale))
         if screen is None:
-            self.chat_notice_panel.setGeometry(
-                int(round(self.chat_metrics["notice_left"] * self.resolution_scale)),
-                320 + int(round((self.chat_metrics["panel_height"] + self.chat_metrics["notice_gap"]) * self.resolution_scale)),
+            self.chat_panel.setGeometry(
+                self.chat_panel_pos_override.x() if self.chat_panel_pos_override is not None else int(round(self.chat_metrics["panel_left"] * self.resolution_scale)),
+                self.chat_panel_pos_override.y() if self.chat_panel_pos_override is not None else 320,
                 width,
                 height,
             )
             return
         available = screen.availableGeometry()
-        left = available.left() + int(round(self.chat_metrics["notice_left"] * self.resolution_scale))
-        top = available.top() + int((available.height() - int(round(self.chat_metrics["panel_height"] * self.resolution_scale))) / 2)
-        top += int(round((self.chat_metrics["panel_height"] + self.chat_metrics["notice_gap"]) * self.resolution_scale))
-        self.chat_notice_panel.setGeometry(left, top, width, height)
+        anchor_offset = int(round(self.chat_metrics["panel_anchor_y"] * self.resolution_scale))
+        left = available.left() + int(round(self.chat_metrics["panel_left"] * self.resolution_scale))
+        top = available.top() + int((available.height() - height) / 2) + anchor_offset
+        if self.chat_panel_pos_override is not None:
+            left = self.chat_panel_pos_override.x()
+            top = self.chat_panel_pos_override.y()
+        self.chat_panel.setGeometry(left, top, width, height)
+
+    def _position_chat_notice_window(self) -> None:
+        return
+
+    def _set_chat_preview_mode(self, enabled: bool) -> None:
+        self.chat_preview_mode = enabled
+        if hasattr(self, "chat_preview_frame"):
+            self.chat_preview_frame.hide()
+        self.chat_history_frame.setVisible(True)
+        self.chat_input_frame.setVisible(not enabled)
+        self.chat_hint_label.setVisible(not enabled)
+        if hasattr(self, "chat_preview_spacer"):
+            self.chat_preview_spacer.setFixedHeight(self.chat_input_frame.sizeHint().height() + self.chat_hint_label.sizeHint().height() + self.chat_shell.layout().spacing())
+            self.chat_preview_spacer.setVisible(enabled)
+        if hasattr(self, "chat_history_frame_style"):
+            self.chat_history_frame.setStyleSheet(self.chat_history_preview_style if enabled else self.chat_history_frame_style)
+        self._refresh_chat_preview_items()
+
+    def _refresh_chat_preview_items(self) -> None:
+        if not hasattr(self, "chat_history"):
+            return
+        visible_preview_count = 0
+        for row in range(self.chat_history.count()):
+            item = self.chat_history.item(row)
+            is_preview = bool(item.data(Qt.UserRole + 1))
+            if self.chat_preview_mode:
+                item.setHidden(not is_preview)
+                if is_preview:
+                    visible_preview_count += 1
+            else:
+                item.setHidden(False)
+        if self.chat_preview_mode:
+            self.chat_history.scrollToBottom()
+            if visible_preview_count == 0 and hasattr(self, "chat_panel") and self.chat_panel.isVisible():
+                self._hide_chat_panel()
+
+    def _clear_chat_preview_items(self) -> None:
+        self.chat_preview_mode = False
+        for key, (_, timer) in list(self.chat_preview_timers.items()):
+            timer.stop()
+            self.chat_preview_timers.pop(key, None)
+        if hasattr(self, "chat_history"):
+            for row in range(self.chat_history.count()):
+                item = self.chat_history.item(row)
+                item.setData(Qt.UserRole + 1, False)
+                item.setHidden(False)
+
+    def _expire_chat_preview_item(self, item_id: int) -> None:
+        entry = self.chat_preview_timers.pop(item_id, None)
+        if entry is None:
+            return
+        item, timer = entry
+        timer.stop()
+        item.setData(Qt.UserRole + 1, False)
+        if self.chat_preview_mode:
+            item.setHidden(True)
+            self._refresh_chat_preview_items()
 
     def _activate_chat_input(self) -> None:
         if not hasattr(self, "chat_enabled_checkbox") or not self.chat_enabled_checkbox.isChecked() or not self.is_logged_in:
@@ -1075,51 +1579,176 @@ class AttendanceWidget(QWidget):
 
     def _show_chat_panel(self, focus_input: bool = False) -> None:
         self._position_chat_window()
+        self._clear_chat_preview_items()
+        self._set_chat_preview_mode(False)
         self.chat_panel.show()
         self.chat_panel.raise_()
         self.chat_panel.activateWindow()
+        if hasattr(self, "chat_hide_timer"):
+            self.chat_hide_timer.stop()
+        self.chat_history.scrollToBottom()
         if focus_input:
             self.chat_input.setFocus()
-        self._restart_chat_hide_timer()
 
     def _hide_chat_panel_if_idle(self) -> None:
-        if self.chat_input.hasFocus():
-            self._restart_chat_hide_timer()
-            return
-        self._hide_chat_panel()
+        if self.chat_preview_mode:
+            self._hide_chat_panel()
 
     def _hide_chat_panel(self) -> None:
         if hasattr(self, "chat_panel"):
             self.chat_panel.hide()
-        if hasattr(self, "chat_notice_panel"):
-            self.chat_notice_panel.hide()
+        self.chat_preview_mode = False
+        if hasattr(self, "chat_history"):
+            for row in range(self.chat_history.count()):
+                self.chat_history.item(row).setHidden(False)
         if hasattr(self, "chat_hide_timer"):
             self.chat_hide_timer.stop()
-        if hasattr(self, "chat_notice_timer"):
-            self.chat_notice_timer.stop()
 
     def _restart_chat_hide_timer(self) -> None:
-        if not hasattr(self, "chat_hide_timer"):
-            return
-        seconds = max(3, self.chat_hide_slider.value()) if hasattr(self, "chat_hide_slider") else 8
-        self.chat_hide_timer.start(seconds * 1000)
+        return
+
+    def _remove_chat_notice_card(self, card: QFrame) -> None:
+        return
+
+    def _hide_expired_chat_notices(self) -> None:
+        return
 
     def _show_chat_notice(self, sender: str, text: str, color: str) -> None:
-        self._position_chat_notice_window()
-        self.chat_notice_sender.setText(sender)
-        self.chat_notice_text.setText(text)
-        style = f"color: {color}; font-family: '{self.chat_font_family}'; font-size: {max(12, int(round(self.chat_metrics['message_font_size'] * self.resolution_scale)))}px; background: transparent;"
-        self.chat_notice_sender.setStyleSheet(style)
-        self.chat_notice_text.setStyleSheet(style)
-        self.chat_notice_panel.show()
-        self.chat_notice_panel.raise_()
-        self.chat_notice_panel.activateWindow()
-        self.chat_notice_timer.start(max(3, self.chat_hide_slider.value()) * 1000)
+        if hasattr(self, "chat_panel") and self.chat_panel.isVisible() and not self.chat_preview_mode:
+            return
+        self._position_chat_window()
+        last_item = self.chat_history.item(self.chat_history.count() - 1) if self.chat_history.count() else None
+        if last_item is None:
+            return
+        self._set_chat_preview_mode(True)
+        last_item.setData(Qt.UserRole + 1, True)
+        last_item.setForeground(QColor(color))
+        last_item.setHidden(False)
+        lifetime_ms = (max(3, self.chat_hide_slider.value()) if hasattr(self, "chat_hide_slider") else 8) * 1000
+        item_id = id(last_item)
+        existing = self.chat_preview_timers.pop(item_id, None)
+        if existing is not None:
+            existing[1].stop()
+        timer = QTimer(self)
+        timer.setSingleShot(True)
+        timer.timeout.connect(lambda item_key=item_id: self._expire_chat_preview_item(item_key))
+        timer.start(lifetime_ms)
+        self.chat_preview_timers[item_id] = (last_item, timer)
+        self.chat_panel.show()
+        self.chat_panel.raise_()
+        self.chat_panel.activateWindow()
+        self.chat_history.scrollToBottom()
+        self._refresh_chat_preview_items()
+
+    def _chat_resize_hit_test(self, global_pos: QPoint) -> str:
+        if not hasattr(self, "chat_panel"):
+            return ""
+        local = self.chat_panel.mapFromGlobal(global_pos)
+        rect = self.chat_panel.rect()
+        margin = max(8, int(round(10 * self.resolution_scale)))
+        edges = ""
+        if local.x() <= margin:
+            edges += "left"
+        elif local.x() >= rect.width() - margin:
+            edges += "right"
+        if local.y() <= margin:
+            edges += "top"
+        elif local.y() >= rect.height() - margin:
+            edges += "bottom"
+        return edges
+
+    def _chat_resize_cursor(self, edges: str):
+        if "left" in edges and "top" in edges or "right" in edges and "bottom" in edges:
+            return Qt.SizeFDiagCursor
+        if "right" in edges and "top" in edges or "left" in edges and "bottom" in edges:
+            return Qt.SizeBDiagCursor
+        if "left" in edges or "right" in edges:
+            return Qt.SizeHorCursor
+        if "top" in edges or "bottom" in edges:
+            return Qt.SizeVerCursor
+        return Qt.ArrowCursor
+
+    def _update_chat_resize_cursor(self, global_pos: QPoint) -> None:
+        if not hasattr(self, "chat_panel"):
+            return
+        if self.chat_resize_edges:
+            self.chat_panel.setCursor(self._chat_resize_cursor(self.chat_resize_edges))
+            return
+        edges = self._chat_resize_hit_test(global_pos)
+        self.chat_panel.setCursor(self._chat_resize_cursor(edges))
+
+    def _chat_mouse_press_event(self, event) -> None:
+        if event.button() != Qt.LeftButton or not hasattr(self, "chat_panel"):
+            return
+        global_pos = event.globalPosition().toPoint()
+        edges = self._chat_resize_hit_test(global_pos)
+        if edges:
+            self.chat_resize_edges = edges
+            self.chat_resize_origin = global_pos
+            self.chat_resize_start_geometry = self.chat_panel.geometry()
+            self.chat_panel.setCursor(self._chat_resize_cursor(edges))
+        else:
+            self.chat_drag_origin = global_pos - self.chat_panel.frameGeometry().topLeft()
+        event.accept()
+
+    def _chat_mouse_move_event(self, event) -> None:
+        if not hasattr(self, "chat_panel"):
+            return
+        global_pos = event.globalPosition().toPoint()
+        if self.chat_resize_edges and self.chat_resize_origin is not None and self.chat_resize_start_geometry is not None and (event.buttons() & Qt.LeftButton):
+            start = self.chat_resize_start_geometry
+            delta = global_pos - self.chat_resize_origin
+            min_width = max(260, int(round(260 * self.resolution_scale)))
+            min_height = max(180, int(round(180 * self.resolution_scale)))
+            left = start.left()
+            top = start.top()
+            width = start.width()
+            height = start.height()
+            if "right" in self.chat_resize_edges:
+                width = max(min_width, start.width() + delta.x())
+            if "bottom" in self.chat_resize_edges:
+                height = max(min_height, start.height() + delta.y())
+            if "left" in self.chat_resize_edges:
+                new_left = start.left() + delta.x()
+                max_left = start.right() - min_width + 1
+                left = min(new_left, max_left)
+                width = start.right() - left + 1
+            if "top" in self.chat_resize_edges:
+                new_top = start.top() + delta.y()
+                max_top = start.bottom() - min_height + 1
+                top = min(new_top, max_top)
+                height = start.bottom() - top + 1
+            self.chat_panel.setGeometry(left, top, width, height)
+            self.chat_panel_pos_override = self.chat_panel.pos()
+            self.chat_metrics["panel_width"] = max(1, int(round(width / self.resolution_scale)))
+            self.chat_metrics["panel_height"] = max(1, int(round(height / self.resolution_scale)))
+            self._rewrap_chat_history()
+            event.accept()
+            return
+        if self.chat_drag_origin is not None and (event.buttons() & Qt.LeftButton):
+            next_pos = global_pos - self.chat_drag_origin
+            self.chat_panel.move(next_pos)
+            self.chat_panel_pos_override = self.chat_panel.pos()
+            event.accept()
+            return
+        self._update_chat_resize_cursor(global_pos)
+
+    def _chat_mouse_release_event(self, event) -> None:
+        if event.button() == Qt.LeftButton:
+            self.chat_drag_origin = None
+            self.chat_resize_origin = None
+            self.chat_resize_start_geometry = None
+            self.chat_resize_edges = ""
+            if hasattr(self, "chat_panel"):
+                self.chat_panel_pos_override = self.chat_panel.pos()
+                self.chat_panel.setCursor(Qt.ArrowCursor)
+            event.accept()
+
+    def _sync_chat_identity_field(self) -> None:
+        if hasattr(self, "chat_nickname_input") and hasattr(self, "username_input"):
+            self.chat_nickname_input.setText(self.username_input.text().strip())
 
     def _chat_display_name(self) -> str:
-        nickname = self.chat_nickname_input.text().strip() if hasattr(self, "chat_nickname_input") else ""
-        if nickname:
-            return nickname
         username = self.username_input.text().strip() if hasattr(self, "username_input") else ""
         return username or "익명"
 
@@ -1136,6 +1765,7 @@ class AttendanceWidget(QWidget):
             multicast_group=group,
             port=port,
             system_messages=self.chat_system_checkbox.isChecked(),
+            avatar_name=self.selected_thumbnail_name,
         )
 
     def _connect_chat_if_needed(self) -> None:
@@ -1146,21 +1776,31 @@ class AttendanceWidget(QWidget):
         config = self._chat_config_from_ui()
         self.chat_client = LanChatClient(config, self)
         self.chat_client.message_received.connect(self._handle_chat_message)
-        self.chat_client.status_changed.connect(self._handle_chat_status)
         self.chat_client.connection_changed.connect(self._handle_chat_connection_changed)
         self.chat_client.error_occurred.connect(self._handle_chat_error)
         self.chat_client.start()
-        self.chat_state_label.setText(f"{config.room} 연결 중")
+        self._upsert_chat_user(self.chat_client.client_id, self._chat_display_name(), self.selected_thumbnail_name, is_self=True)
+        if not self.chat_presence_announced:
+            text = f"{self._chat_display_name()} 님이 입장하셨습니다"
+            self._append_chat_entry("시스템", text, system=True, color="#57d66b")
+            self._show_chat_notice("시스템", text, "#57d66b")
+            self.chat_presence_announced = True
 
     def _disconnect_chat(self) -> None:
         if self.chat_client is None:
             return
+        leaving_client_id = self.chat_client.client_id
+        if self.chat_presence_announced:
+            text = f"{self._chat_display_name()} 님이 퇴장하셨습니다"
+            self._append_chat_entry("시스템", text, system=True, color="#ff5a5a")
+            self._show_chat_notice("시스템", text, "#ff5a5a")
         client = self.chat_client
         self.chat_client = None
         client.stop()
         self.chat_connected = False
-        if hasattr(self, "chat_state_label"):
-            self.chat_state_label.setText("연결 안 됨")
+        self.chat_presence_announced = False
+        self._remove_chat_user(leaving_client_id)
+        self._hide_chat_roster()
         self._hide_chat_panel()
 
     def _reconnect_chat(self) -> None:
@@ -1172,7 +1812,6 @@ class AttendanceWidget(QWidget):
     def _persist_chat_preferences(self) -> None:
         self.qt_settings.setValue("chat_enabled", self.chat_enabled_checkbox.isChecked())
         self.qt_settings.setValue("chat_system_messages", self.chat_system_checkbox.isChecked())
-        self.qt_settings.setValue("chat_nickname", self.chat_nickname_input.text().strip())
         self.qt_settings.setValue("chat_room", self.chat_room_input.text().strip())
         self.qt_settings.setValue("chat_group", self.chat_group_input.text().strip())
         self.qt_settings.setValue("chat_port", self.chat_port_input.text().strip())
@@ -1181,9 +1820,9 @@ class AttendanceWidget(QWidget):
         self.qt_settings.sync()
 
     def _wrap_chat_text(self, text: str) -> str:
-        available_width = max(180, self.chat_history.viewport().width() - 24) if hasattr(self, "chat_history") else 320
+        available_width = max(180, self.chat_history.viewport().width() - 10) if hasattr(self, "chat_history") else 320
         font_size = max(12, int(round(self.chat_metrics['message_font_size'] * self.resolution_scale)))
-        approx_char_width = max(7, int(font_size * 0.75))
+        approx_char_width = max(6, int(font_size * 0.68))
         chars_per_line = max(12, available_width // approx_char_width)
 
         wrapped_lines: list[str] = []
@@ -1198,20 +1837,35 @@ class AttendanceWidget(QWidget):
             wrapped_lines.append(line)
         return "\n".join(wrapped_lines)
 
-    def _append_chat_entry(self, sender: str, text: str, system: bool = False, timestamp: float | None = None, color: str | None = None) -> None:
+    def _rewrap_chat_history(self) -> None:
+        if not hasattr(self, "chat_history"):
+            return
+        for row in range(self.chat_history.count()):
+            item = self.chat_history.item(row)
+            raw_line = item.data(Qt.UserRole + 2)
+            if not raw_line:
+                continue
+            item.setText(self._wrap_chat_text(str(raw_line)))
+            item.setSizeHint(item.sizeHint())
+        self.chat_history.updateGeometry()
+
+    def _append_chat_entry(self, sender: str, text: str, system: bool = False, timestamp: float | None = None, color: str | None = None) -> QListWidgetItem:
         when = datetime.fromtimestamp(timestamp) if timestamp else datetime.now()
         prefix = when.strftime("%H:%M")
-        if system:
-            line = self._wrap_chat_text(f"[{prefix}] {text}")
-        else:
-            line = self._wrap_chat_text(f"[{prefix}] {sender}: {text}")
+        raw_line = f"[{prefix}] {text}" if system else f"[{prefix}] {sender}: {text}"
+        line = self._wrap_chat_text(raw_line)
         item = QListWidgetItem(line)
-        item.setForeground(QColor(color or ("#7aeaff" if not system else "#7aeaff")))
+        item.setData(Qt.UserRole + 1, False)
+        item.setData(Qt.UserRole + 2, raw_line)
+        item.setData(Qt.UserRole + 3, color or ("#00d9ff" if not system else "#00d9ff"))
+        item.setForeground(QColor(color or ("#00d9ff" if not system else "#00d9ff")))
         item.setSizeHint(item.sizeHint())
         self.chat_history.addItem(item)
         while self.chat_history.count() > 60:
-            self.chat_history.takeItem(0)
+            removed = self.chat_history.takeItem(0)
+            self.chat_preview_timers.pop(id(removed), None)
         self.chat_history.scrollToBottom()
+        return item
 
     def _send_chat_message(self, text: str) -> None:
         if not text.strip():
@@ -1221,50 +1875,51 @@ class AttendanceWidget(QWidget):
             self._handle_chat_error("채팅 연결을 시작할 수 없습니다.")
             return
         self.chat_client.send_chat(text)
-        self._append_chat_entry(self._chat_display_name(), text, system=False, color="#00b0e6")
+        self._append_chat_entry(self._chat_display_name(), text, system=False, color="#003cff")
         self._show_chat_panel(focus_input=True)
 
     def _handle_chat_message(self, message: dict) -> None:
         message_type = message.get("type")
         sender = str(message.get("sender", "알 수 없음"))
+        sender_client_id = str(message.get("client_id", ""))
+        avatar_name = str(message.get("avatar_name", ""))
         timestamp = float(message.get("timestamp", 0) or 0)
         if message_type == "system":
-            if not self.chat_system_checkbox.isChecked():
-                return
             event = message.get("event")
-            if event == "join":
-                text = f"{sender}님이 입장하셨습니다"
+            if event in {"join", "presence"}:
+                self._upsert_chat_user(sender_client_id, sender, avatar_name)
+                if event == "presence":
+                    return
+                text = f"{sender} 님이 입장하셨습니다"
                 color = "#57d66b"
             elif event == "leave":
-                text = f"{sender}님이 퇴장하셨습니다"
+                self._remove_chat_user(sender_client_id)
+                text = f"{sender} 님이 퇴장하셨습니다"
                 color = "#ff5a5a"
             else:
-                text = f"{sender} 시스템 메시지"
-                color = "#8fefff"
+                return
             self._append_chat_entry("시스템", text, system=True, timestamp=timestamp, color=color)
             self._show_chat_notice("시스템", text, color)
             return
-
+        self._upsert_chat_user(sender_client_id, sender, avatar_name)
         chat_text = str(message.get("text", ""))
         self._append_chat_entry(sender, chat_text, system=False, timestamp=timestamp, color="#8fefff")
         self._show_chat_notice(sender, chat_text, "#8fefff")
 
     def _handle_chat_status(self, status: str) -> None:
-        self.chat_state_label.setText(status)
+        return
 
     def _handle_chat_connection_changed(self, connected: bool) -> None:
-        was_connected = self.chat_connected
         self.chat_connected = connected
-        self.chat_state_label.setText("연결됨" if connected else "연결 안 됨")
+        if not connected:
+            self.chat_users.clear()
+            self._hide_chat_roster()
+            self._update_chat_roster_window()
         self.chat_reconnect_button.setEnabled(self.chat_enabled_checkbox.isChecked())
-        if connected and not was_connected:
-            self._append_chat_entry("시스템", f"{self._chat_display_name()} 님이 입장하셨습니다", system=True, color="#57d66b")
-        elif not connected and was_connected:
-            self._append_chat_entry("시스템", f"{self._chat_display_name()} 님이 퇴장하셨습니다", system=True, color="#ff5a5a")
+
     def _handle_chat_error(self, message: str) -> None:
-        self.chat_state_label.setText("오류")
-        self._append_chat_entry("시스템", message, system=True, color="#ff9b5c")
-        self._show_chat_notice("시스템", message, "#ff9b5c")
+        return
+
     def _on_chat_enabled_toggled(self, checked: bool) -> None:
         self.chat_reconnect_button.setEnabled(checked)
         self.qt_settings.setValue("chat_enabled", checked)
@@ -1282,6 +1937,52 @@ class AttendanceWidget(QWidget):
         self._persist_chat_preferences()
         if self.chat_client is not None and self.chat_client.isRunning() and self.chat_enabled_checkbox.isChecked():
             self._reconnect_chat()
+
+    def _chat_scrollbar_style(self) -> str:
+        scroll_handle_radius = max(4, int(round(self.chat_metrics["scrollbar_radius"] * self.resolution_scale)))
+        return (
+            "QScrollBar:vertical {"
+            " background: transparent;"
+            f" width: {max(8, int(round(self.chat_metrics['scrollbar_width'] * self.resolution_scale)))}px;"
+            f" margin: {max(0, int(round(self.chat_metrics['scrollbar_margin_top'] * self.resolution_scale)))}px {max(0, int(round(self.chat_metrics['scrollbar_margin_right'] * self.resolution_scale)))}px {max(0, int(round(self.chat_metrics['scrollbar_margin_bottom'] * self.resolution_scale)))}px 0px;"
+            " border: none;"
+            "}"
+            "QScrollBar::handle:vertical {"
+            " background: rgba(245, 248, 255, 0.78);"
+            f" border-radius: {scroll_handle_radius}px;"
+            f" min-height: {max(24, int(round(self.chat_metrics['scrollbar_handle_min_height'] * self.resolution_scale)))}px;"
+            "}"
+            "QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {"
+            " height: 0px;"
+            " background: transparent;"
+            " border: none;"
+            "}"
+            "QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {"
+            " background: transparent;"
+            "}"
+        )
+
+    def _apply_chat_font_size(self) -> None:
+        history_font_size = max(10, int(round(self.chat_metrics['message_font_size'] * self.resolution_scale)))
+        input_font_size = max(10, int(round(self.chat_metrics['input_font_size'] * self.resolution_scale)))
+        self.chat_history.setStyleSheet(
+            f"QListWidget {{ background: transparent; color: rgba(242,247,255,0.95); border: none; outline: none; font-family: '{self.chat_font_family}'; font-size: {history_font_size}px; padding-right: 4px; }}"
+            "QListWidget::item { padding: 4px 2px; border: none; }"
+            + self._chat_scrollbar_style()
+        )
+        self.chat_input.setStyleSheet(
+            f"QPlainTextEdit {{ background: transparent; color: #f3f8ff; border: none; padding: {self._scaled_chat_metric('input_text_padding_y')}px {self._scaled_chat_metric('input_text_padding_x')}px; font-family: '{self.chat_font_family}'; font-size: {input_font_size}px; }}"
+            f"QPlainTextEdit[placeholderText] {{ color: rgba(211,224,240,0.46); }}"
+            + self._chat_scrollbar_style()
+        )
+
+    def _on_chat_font_size_changed(self, value: int) -> None:
+        value = max(10, min(32, value))
+        self.chat_metrics['message_font_size'] = value
+        self.chat_metrics['input_font_size'] = value
+        self.chat_font_size_value_label.setText(f"{value}px")
+        self.qt_settings.setValue("chat_font_size", value)
+        self._apply_chat_font_size()
 
     def _on_chat_hide_seconds_changed(self, value: int) -> None:
         value = max(3, min(30, value))
@@ -1549,10 +2250,16 @@ class AttendanceWidget(QWidget):
 
         self.chat_enabled_checkbox.setChecked(self.qt_settings.value("chat_enabled", True, type=bool))
         self.chat_system_checkbox.setChecked(self.qt_settings.value("chat_system_messages", True, type=bool))
-        self.chat_nickname_input.setText(self.qt_settings.value("chat_nickname", "", type=str) or "")
+        self._sync_chat_identity_field()
         self.chat_room_input.setText(self.qt_settings.value("chat_room", "attendance-room", type=str) or "attendance-room")
         self.chat_group_input.setText(self.qt_settings.value("chat_group", "239.255.42.99", type=str) or "239.255.42.99")
         self.chat_port_input.setText(self.qt_settings.value("chat_port", "45454", type=str) or "45454")
+        saved_chat_font = max(10, min(32, int(self.qt_settings.value("chat_font_size", self.chat_metrics['message_font_size'], type=int))))
+        self.chat_font_size_slider.setValue(saved_chat_font)
+        self.chat_font_size_value_label.setText(f"{saved_chat_font}px")
+        self.chat_metrics['message_font_size'] = saved_chat_font
+        self.chat_metrics['input_font_size'] = saved_chat_font
+        self._apply_chat_font_size()
         saved_chat_hide = max(3, min(30, int(self.qt_settings.value("chat_hide_seconds", 8, type=int))))
         self.chat_hide_slider.setValue(saved_chat_hide)
         self.chat_hide_value_label.setText(f"{saved_chat_hide}초")
@@ -1564,6 +2271,7 @@ class AttendanceWidget(QWidget):
 
     def _save_preferences(self) -> None:
         self.qt_settings.setValue("username", self.username_input.text().strip())
+        self._sync_chat_identity_field()
         self.qt_settings.setValue("password", self.password_input.text())
         self.qt_settings.setValue("headless", self.headless_checkbox.isChecked())
         self.qt_settings.setValue("always_on_top", self.always_on_top_checkbox.isChecked())
@@ -1612,6 +2320,8 @@ class AttendanceWidget(QWidget):
             self.details_panel.close()
         if hasattr(self, "chat_panel") and self.chat_panel is not None:
             self.chat_panel.close()
+        if hasattr(self, "chat_roster_panel") and self.chat_roster_panel is not None:
+            self.chat_roster_panel.close()
         if hasattr(self, "chat_notice_panel") and self.chat_notice_panel is not None:
             self.chat_notice_panel.close()
         self.close()
@@ -1627,6 +2337,8 @@ class AttendanceWidget(QWidget):
             self.details_panel.close()
         if hasattr(self, "chat_panel") and self.chat_panel is not None:
             self.chat_panel.close()
+        if hasattr(self, "chat_roster_panel") and self.chat_roster_panel is not None:
+            self.chat_roster_panel.close()
         if hasattr(self, "chat_notice_panel") and self.chat_notice_panel is not None:
             self.chat_notice_panel.close()
         super().closeEvent(event)
@@ -1673,14 +2385,14 @@ class AttendanceWidget(QWidget):
             self.card_loading = False
             self._update_score_card(self.current_balance_minutes)
         self.refresh_button.setEnabled(self.is_logged_in and not busy)
-        self.work_in_button.setEnabled(self.is_logged_in and not busy)
-        self.work_out_button.setEnabled(self.is_logged_in and not busy)
+        if hasattr(self, "snapshot") and self.snapshot is not None:
+            self._update_today_action_buttons(self.snapshot)
+        else:
+            self.work_in_button.setEnabled(self.is_logged_in and not busy)
+            self.work_out_button.setEnabled(self.is_logged_in and not busy)
         if not self.is_logged_in:
             self.login_button.setEnabled(not busy)
             self.headless_checkbox.setEnabled(not busy)
-        if message:
-            self.status_label.setText(message)
-
     def _set_logged_in_ui(self, logged_in: bool) -> None:
         self.is_logged_in = logged_in
         self.username_input.setEnabled(not logged_in)
@@ -1690,13 +2402,17 @@ class AttendanceWidget(QWidget):
         self.refresh_button.setEnabled(logged_in and not self.is_busy)
         self.work_in_button.setEnabled(logged_in and not self.is_busy)
         self.work_out_button.setEnabled(logged_in and not self.is_busy)
+        if not logged_in:
+            self.work_in_time_label.setText("")
+            self.work_out_time_label.setText("")
 
     def _handle_login_success(self, snapshot: AttendanceSnapshot) -> None:
         self._set_logged_in_ui(True)
         self.snapshot = snapshot
         self._update_summary_ui(snapshot)
-        self.status_label.setText("접속 완료. 숨겨진 브라우저 세션이 초과근무 페이지에서 실행 중입니다.")
+        self.status_label.setText("접속 완료. 숨깨진 브라우저 세션이 초과근무 페이지에서 실행 중입니다.")
         self.refresh_timer.start()
+        self._connect_chat_if_needed()
         self._set_busy(False)
 
     def _handle_action_success(self, snapshot: AttendanceSnapshot, action: str) -> None:
@@ -1714,6 +2430,22 @@ class AttendanceWidget(QWidget):
         self._set_busy(False)
         QMessageBox.critical(self, "근태 위젯", message)
 
+    def _update_today_action_buttons(self, snapshot: AttendanceSnapshot) -> None:
+        today_date = date.today().strftime("%Y%m%d")
+        today_row = snapshot.today if snapshot.today and snapshot.today.date == today_date else None
+        if today_row is None:
+            for row in snapshot.weekly_rows:
+                if row.date == today_date:
+                    today_row = row
+                    break
+
+        raw_come = (today_row.come_time or "") if today_row is not None else ""
+        raw_leave = (today_row.leave_time or "") if today_row is not None else ""
+        self.work_in_time_label.setText(self._format_clock(raw_come) if raw_come else "")
+        self.work_out_time_label.setText(self._format_clock(raw_leave) if raw_leave else "")
+        self.work_in_button.setEnabled(self.is_logged_in and not self.is_busy and not raw_come)
+        self.work_out_button.setEnabled(self.is_logged_in and not self.is_busy)
+
     def _update_summary_ui(self, snapshot: AttendanceSnapshot) -> None:
         balance_minutes = snapshot.summary.balance_minutes
         self._update_score_card(balance_minutes)
@@ -1722,6 +2454,7 @@ class AttendanceWidget(QWidget):
             f"기준 {snapshot.summary.expected_minutes // 60}h {(snapshot.summary.expected_minutes % 60):02d}m"
         )
         self._update_day_rows(snapshot)
+        self._update_today_action_buttons(snapshot)
 
     def _update_score_card(self, balance_minutes: int) -> None:
         self.current_balance_minutes = balance_minutes
@@ -1807,7 +2540,11 @@ class AttendanceWidget(QWidget):
             self.chat_panel.setWindowFlag(Qt.FramelessWindowHint, True)
             self.chat_panel.setWindowFlag(Qt.Tool, True)
             self.chat_panel.setWindowFlag(Qt.WindowStaysOnTopHint, always_on_top)
-        if hasattr(self, "chat_notice_panel"):
+        if hasattr(self, "chat_roster_panel"):
+            self.chat_roster_panel.setWindowFlag(Qt.FramelessWindowHint, True)
+            self.chat_roster_panel.setWindowFlag(Qt.Tool, True)
+            self.chat_roster_panel.setWindowFlag(Qt.WindowStaysOnTopHint, always_on_top)
+        if hasattr(self, "chat_notice_panel") and self.chat_notice_panel is not None:
             self.chat_notice_panel.setWindowFlag(Qt.FramelessWindowHint, True)
             self.chat_notice_panel.setWindowFlag(Qt.Tool, True)
             self.chat_notice_panel.setWindowFlag(Qt.WindowStaysOnTopHint, always_on_top)
@@ -1820,7 +2557,10 @@ class AttendanceWidget(QWidget):
         if hasattr(self, "chat_panel") and self.chat_panel.isVisible():
             self.chat_panel.show()
             self._position_chat_window()
-        if hasattr(self, "chat_notice_panel") and self.chat_notice_panel.isVisible():
+        if hasattr(self, "chat_roster_panel") and self.chat_roster_panel.isVisible():
+            self.chat_roster_panel.show()
+            self._position_chat_roster_window()
+        if hasattr(self, "chat_notice_panel") and self.chat_notice_panel is not None and self.chat_notice_panel.isVisible():
             self.chat_notice_panel.show()
             self._position_chat_notice_window()
             self._position_chat_notice_window()
@@ -1872,6 +2612,27 @@ class AttendanceWidget(QWidget):
         if self.details_panel.isVisible():
             self._position_settings_window()
         self._position_chat_window()
+        self._position_chat_roster_window()
+
+    def eventFilter(self, obj, event) -> bool:
+        active_window = QApplication.activeWindow()
+        tracked_windows = {self, getattr(self, "details_panel", None), getattr(self, "chat_panel", None), getattr(self, "chat_roster_panel", None)}
+        if active_window not in tracked_windows:
+            return super().eventFilter(obj, event)
+        if event.type() == QEvent.ShortcutOverride and event.key() == Qt.Key_Tab:
+            event.accept()
+            return True
+        if event.type() == QEvent.KeyPress and event.key() == Qt.Key_Tab and not event.isAutoRepeat():
+            event.accept()
+            if self.chat_roster_visible:
+                self._hide_chat_roster()
+            else:
+                self._show_chat_roster()
+            return True
+        if event.type() == QEvent.KeyRelease and event.key() == Qt.Key_Tab and not event.isAutoRepeat():
+            event.accept()
+            return True
+        return super().eventFilter(obj, event)
 
     def mousePressEvent(self, event) -> None:
         if event.button() == Qt.LeftButton:

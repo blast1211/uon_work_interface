@@ -20,6 +20,7 @@ class ChatConfig:
     multicast_group: str
     port: int
     system_messages: bool
+    avatar_name: str = ""
 
 
 class LanChatClient(QThread):
@@ -48,6 +49,7 @@ class LanChatClient(QThread):
         self.connection_changed.emit(True)
         self.status_changed.emit(f"채팅방 접속: {self.config.room} / ID: {self.config.nickname}")
         self._queue_system_message("join")
+        self._queue_system_message("presence_request")
 
         while self._running.is_set():
             self._flush_outgoing()
@@ -65,6 +67,11 @@ class LanChatClient(QThread):
                 continue
             if message.get("client_id") == self.client_id:
                 continue
+
+            if message.get("type") == "system" and message.get("event") == "presence_request":
+                self._queue_system_message("presence", target_client_id=str(message.get("client_id", "")))
+                continue
+
             message["source_address"] = address[0]
             self.message_received.emit(message)
 
@@ -90,13 +97,12 @@ class LanChatClient(QThread):
                 "sender": self.config.nickname,
                 "client_id": self.client_id,
                 "timestamp": time.time(),
+                "avatar_name": self.config.avatar_name,
                 "text": clean_text,
             }
         )
 
-    def _queue_system_message(self, event: str) -> None:
-        if not self.config.system_messages:
-            return
+    def _queue_system_message(self, event: str, target_client_id: str = "") -> None:
         self._outgoing.put(
             {
                 "type": "system",
@@ -104,6 +110,8 @@ class LanChatClient(QThread):
                 "room": self.config.room,
                 "sender": self.config.nickname,
                 "client_id": self.client_id,
+                "target_client_id": target_client_id,
+                "avatar_name": self.config.avatar_name,
                 "timestamp": time.time(),
                 "text": "",
             }
