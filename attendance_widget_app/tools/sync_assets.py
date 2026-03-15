@@ -25,7 +25,31 @@ ASSET_FILES = [
 
 def copy_file(source: Path, target: Path) -> None:
     target.parent.mkdir(parents=True, exist_ok=True)
+    if source.resolve() == target.resolve():
+        return
     shutil.copy2(source, target)
+
+
+def _find_asset_source(name: str) -> Path | None:
+    candidates = [
+        WORKSPACE_ROOT / name,
+        TARGET_ASSETS / name,
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def _find_thumbnail_source() -> Path | None:
+    candidates = [
+        WORKSPACE_ROOT / "thumbnail",
+        TARGET_THUMBNAIL,
+    ]
+    for candidate in candidates:
+        if candidate.exists() and any(item.is_file() for item in candidate.iterdir()):
+            return candidate
+    return None
 
 
 def main() -> int:
@@ -33,33 +57,31 @@ def main() -> int:
     TARGET_THUMBNAIL.mkdir(parents=True, exist_ok=True)
 
     for name in ASSET_FILES:
-        source = WORKSPACE_ROOT / name
-        if not source.exists():
-            if name == "hog_thumb.png":
-                continue
-            raise FileNotFoundError(f"Missing asset: {source}")
+        source = _find_asset_source(name)
+        if source is None:
+            raise FileNotFoundError(f"Missing asset: {name}")
         copy_file(source, TARGET_ASSETS / name)
 
-    source_thumbnail = WORKSPACE_ROOT / "thumbnail"
-    if not source_thumbnail.exists():
-        raise FileNotFoundError(f"Missing thumbnail directory: {source_thumbnail}")
+    source_thumbnail = _find_thumbnail_source()
+    if source_thumbnail is None:
+        raise FileNotFoundError("Missing thumbnail directory")
 
     for existing in TARGET_THUMBNAIL.iterdir():
         if existing.is_file():
             existing.unlink()
 
-    thumbnail_files = []
-    for source in source_thumbnail.iterdir():
+    thumbnail_files: list[Path] = []
+    for source in sorted(source_thumbnail.iterdir()):
         if source.is_file():
             copy_file(source, TARGET_THUMBNAIL / source.name)
             thumbnail_files.append(source)
 
     fallback_thumb = TARGET_ASSETS / "hog_thumb.png"
-    source_thumb = WORKSPACE_ROOT / "hog_thumb.png"
-    if source_thumb.exists():
+    source_thumb = _find_asset_source("hog_thumb.png")
+    if source_thumb is not None:
         copy_file(source_thumb, fallback_thumb)
     elif thumbnail_files:
-        copy_file(sorted(thumbnail_files)[0], fallback_thumb)
+        copy_file(thumbnail_files[0], fallback_thumb)
 
     print(f"Synced assets to {TARGET_ASSETS}")
     return 0

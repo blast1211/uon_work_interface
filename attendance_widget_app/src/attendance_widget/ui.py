@@ -1914,8 +1914,8 @@ class AttendanceWidget(QWidget):
             return
         self._upsert_chat_user(sender_client_id, sender, avatar_name)
         chat_text = str(message.get("text", ""))
-        self._append_chat_entry(sender, chat_text, system=False, timestamp=timestamp, color="#8fefff")
-        self._show_chat_notice(sender, chat_text, "#8fefff")
+        self._append_chat_entry(sender, chat_text, system=False, timestamp=timestamp, color="#00d9ff")
+        self._show_chat_notice(sender, chat_text, "#00d9ff")
 
     def _handle_chat_status(self, status: str) -> None:
         return
