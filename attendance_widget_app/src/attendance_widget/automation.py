@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from datetime import datetime
 
 from selenium import webdriver
+from selenium.webdriver.chrome.options import Options as ChromeOptions
+from selenium.webdriver.chrome.service import Service as ChromeService
 from selenium.common.exceptions import ElementClickInterceptedException, ElementNotInteractableException, TimeoutException
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
@@ -34,13 +36,14 @@ class AttendanceAutomation(AbstractContextManager["AttendanceAutomation"]):
         self.driver = self._create_driver()
 
     def _create_driver(self) -> webdriver.Chrome:
-        options = webdriver.ChromeOptions()
+        options = ChromeOptions()
         if self.settings.headless:
             options.add_argument("--headless=new")
         options.add_argument("--disable-gpu")
         options.add_argument("--window-size=1400,1000")
         options.set_capability("goog:loggingPrefs", {"performance": "ALL"})
-        return webdriver.Chrome(options=options)
+        service = ChromeService()
+        return webdriver.Chrome(service=service, options=options)
 
     def __exit__(self, exc_type, exc, tb) -> None:
         self.driver.quit()

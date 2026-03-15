@@ -44,21 +44,32 @@ def _discover_asset_root() -> Path:
         meipass_path = Path(meipass)
         candidates.extend([meipass_path / "assets", meipass_path])
 
-    if getattr(sys, "frozen", False):
-        exe_dir = Path(sys.executable).resolve().parent
+    exe_path = Path(sys.executable).resolve() if getattr(sys, "executable", "") else None
+    if exe_path is not None:
+        exe_dir = exe_path.parent
         candidates.extend([exe_dir / "assets", exe_dir])
 
+    argv0 = Path(sys.argv[0]).resolve() if sys.argv and sys.argv[0] else None
+    if argv0 is not None:
+        argv_dir = argv0.parent
+        candidates.extend([argv_dir / "assets", argv_dir])
+
+    cwd = Path.cwd().resolve()
+    candidates.extend([cwd / "assets", cwd])
     candidates.extend([source_root / "assets", source_root])
 
     seen: set[Path] = set()
     for candidate in candidates:
-        resolved = candidate.resolve()
+        try:
+            resolved = candidate.resolve()
+        except OSError:
+            continue
         if resolved in seen:
             continue
         seen.add(resolved)
         if (resolved / "koverwatch.ttf").exists():
             return resolved
-    return source_root
+    return source_root / "assets" if (source_root / "assets").exists() else source_root
 
 
 ASSET_ROOT = _discover_asset_root()
